@@ -6,7 +6,7 @@ OHLC candles for however many timeframes the strategy needs — in
 particular the 3-min/5-min (LTF), 15-min (ITF), and 75-min (HTF) stack
 config/settings.yaml declares under `timeframes:`.
 
-This module has no dependency on Upstox at all — it takes (instrument_key,
+This module has no dependency on any specific broker at all — it takes (instrument_key,
 price, epoch_ms) in and emits closed Candle objects out — so it's fully
 unit-testable with synthetic ticks, independent of the WS client.
 

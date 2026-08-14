@@ -1,16 +1,21 @@
 """
 execution/option_selector.py
 
-Selects the ATM/ITM option contract (Delta target 0.50-0.60 per
-config.option_selection) via Upstox's Put/Call Option Chain API, and
-caches the result to avoid hitting that endpoint on every tick (Edge Case
-4 from the review). Cache invalidates on a time interval OR when spot has
-moved across a strike interval — whichever happens first.
+Selects the option contract to trade via Fyers' optionchain() API, with
+1-3 min caching (Edge Case 4 from the review) exactly as before.
 
-Field names below (instrument_key, market_data.ask_price,
-option_greeks.delta) are verified against the installed upstox_client
-SDK's OptionStrikeData / PutCallOptionChainData / MarketData / AnalyticsData
-classes (see swagger_types), not guessed.
+IMPORTANT CAVEAT, found during research for this integration: multiple
+Fyers community threads (spanning 2024-2026) ask whether the option chain
+API reliably returns Greeks/Delta at all — this is NOT settled the way
+Upstox's typed SDK response was. So this module tries the documented
+`greeks=1` path first, but if no strike in the response actually carries
+a usable delta field, it falls back to selecting by STRIKE DISTANCE from
+spot (nearest ATM, or N strikes ITM) rather than crashing or silently
+picking a wrong contract. Which path was used is logged explicitly —
+please check for `[DELTA_UNAVAILABLE_FALLBACK]` in tomorrow's log; if it
+fires, the "Delta ≈ 0.50-0.60" selection logic is running in degraded
+mode and the risk math (Spot Risk x Delta = Premium SL) will use an
+assumed delta rather than a live one.
 """
 from __future__ import annotations
 
@@ -19,40 +24,42 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import upstox_client
-from upstox_client.rest import ApiException
-
 logger = logging.getLogger(__name__)
+
+ASSUMED_ATM_DELTA = 0.50  # used only in the fallback path, see module docstring
 
 
 @dataclass
 class SelectedOption:
-    instrument_key: str
+    symbol: str
     strike_price: float
     option_type: str  # "CE" or "PE"
-    ask_price: float
+    ltp: float
     delta: float
-    fetched_at: float  # time.time()
+    delta_is_estimated: bool
+    fetched_at: float
 
 
 class OptionSelector:
     def __init__(
         self,
-        api_client: "upstox_client.ApiClient",
-        underlying_instrument_key: str,
+        fyers_model,
+        underlying_symbol: str,
         strike_interval: float,
         target_delta_min: float = 0.50,
         target_delta_max: float = 0.60,
         cache_refresh_seconds: int = 120,
+        strike_count: int = 10,
     ):
-        self.api = upstox_client.OptionsApi(api_client)
-        self.underlying_instrument_key = underlying_instrument_key
+        self.model = fyers_model
+        self.underlying_symbol = underlying_symbol
         self.strike_interval = strike_interval
         self.target_delta_min = target_delta_min
         self.target_delta_max = target_delta_max
         self.cache_refresh_seconds = cache_refresh_seconds
+        self.strike_count = strike_count
 
-        self._cache: dict[str, SelectedOption] = {}  # "CE"/"PE" -> SelectedOption
+        self._cache: dict[str, SelectedOption] = {}
         self._cache_spot_price: Optional[float] = None
         self._cache_fetched_at: float = 0.0
 
@@ -67,63 +74,82 @@ class OptionSelector:
             return True
         return False
 
-    def _fetch_chain(self, expiry_date: str) -> list["upstox_client.OptionStrikeData"]:
+    def _fetch_chain(self, expiry: str) -> list[dict]:
         try:
-            response = self.api.get_put_call_option_chain(
-                self.underlying_instrument_key, expiry_date
+            response = self.model.optionchain(
+                data={
+                    "symbol": self.underlying_symbol,
+                    "strikecount": self.strike_count,
+                    "timestamp": expiry,
+                    "greeks": "1",
+                }
             )
-        except ApiException as exc:
-            logger.error("Option chain fetch failed: %s", exc)
+        except Exception:  # noqa: BLE001
+            logger.exception("Option chain fetch failed for %s", self.underlying_symbol)
             return []
-        return getattr(response, "data", None) or []
 
-    def _pick_by_delta(
-        self, strikes: list["upstox_client.OptionStrikeData"], option_type: str
-    ) -> Optional[SelectedOption]:
-        best: Optional[SelectedOption] = None
-        best_distance = float("inf")
+        if not isinstance(response, dict) or response.get("s") != "ok":
+            logger.error("Option chain fetch failed for %s: %s", self.underlying_symbol, response)
+            return []
 
-        for strike in strikes:
-            leg = strike.call_options if option_type == "CE" else strike.put_options
-            if leg is None or leg.option_greeks is None or leg.market_data is None:
-                continue
-            delta = leg.option_greeks.delta
-            if delta is None:
-                continue
-            abs_delta = abs(delta)
+        chain = (response.get("data") or {}).get("optionsChain") or []
+        return [row for row in chain if row.get("option_type") in ("CE", "PE")]
 
-            if self.target_delta_min <= abs_delta <= self.target_delta_max:
-                distance = abs(abs_delta - (self.target_delta_min + self.target_delta_max) / 2)
-                if distance < best_distance:
-                    best_distance = distance
-                    best = SelectedOption(
-                        instrument_key=leg.instrument_key,
-                        strike_price=strike.strike_price,
-                        option_type=option_type,
-                        ask_price=leg.market_data.ask_price,
-                        delta=delta,
-                        fetched_at=time.time(),
-                    )
+    def _pick_by_delta(self, chain: list[dict], option_type: str, spot: float) -> Optional[SelectedOption]:
+        candidates = [row for row in chain if row.get("option_type") == option_type]
+        if not candidates:
+            return None
 
-        if best is None:
+        # Path 1: real delta from the response, if present.
+        with_delta = [c for c in candidates if c.get("delta") not in (None, "", 0)]
+        if with_delta:
+            best, best_distance = None, float("inf")
+            midpoint = (self.target_delta_min + self.target_delta_max) / 2
+            for row in with_delta:
+                try:
+                    abs_delta = abs(float(row["delta"]))
+                except (TypeError, ValueError):
+                    continue
+                if self.target_delta_min <= abs_delta <= self.target_delta_max:
+                    distance = abs(abs_delta - midpoint)
+                    if distance < best_distance:
+                        best_distance = distance
+                        best = SelectedOption(
+                            symbol=row["symbol"], strike_price=float(row["strike_price"]),
+                            option_type=option_type, ltp=float(row.get("ltp", 0)),
+                            delta=abs_delta, delta_is_estimated=False, fetched_at=time.time(),
+                        )
+            if best is not None:
+                return best
             logger.warning(
-                "No %s strike found with |delta| in [%.2f, %.2f] — widening search may be needed.",
+                "%s: response had delta values but none in [%.2f, %.2f] — "
+                "falling back to strike-distance selection.",
                 option_type, self.target_delta_min, self.target_delta_max,
             )
-        return best
 
-    def select(
-        self, expiry_date: str, current_spot: float, option_type: str
-    ) -> Optional[SelectedOption]:
-        """option_type: "CE" for a bullish sweep (call buy), "PE" for a
-        bearish sweep (put buy). Returns the cached selection unless the
-        cache is stale (Edge Case 4)."""
+        # Path 2: fallback — no usable delta anywhere in the response.
+        logger.warning(
+            "[DELTA_UNAVAILABLE_FALLBACK] %s: no delta field in option chain response "
+            "for %s — selecting by strike distance from spot instead (assumed delta=%.2f).",
+            option_type, self.underlying_symbol, ASSUMED_ATM_DELTA,
+        )
+        candidates_sorted = sorted(candidates, key=lambda r: abs(float(r["strike_price"]) - spot))
+        if not candidates_sorted:
+            return None
+        row = candidates_sorted[0]  # nearest-to-spot strike, i.e. ATM
+        return SelectedOption(
+            symbol=row["symbol"], strike_price=float(row["strike_price"]),
+            option_type=option_type, ltp=float(row.get("ltp", 0)),
+            delta=ASSUMED_ATM_DELTA, delta_is_estimated=True, fetched_at=time.time(),
+        )
+
+    def select(self, expiry: str, current_spot: float, option_type: str) -> Optional[SelectedOption]:
         if self._cache_is_stale(current_spot):
-            strikes = self._fetch_chain(expiry_date)
-            if not strikes:
+            chain = self._fetch_chain(expiry)
+            if not chain:
                 return self._cache.get(option_type)  # fall back to stale cache over nothing
             for ot in ("CE", "PE"):
-                selected = self._pick_by_delta(strikes, ot)
+                selected = self._pick_by_delta(chain, ot, current_spot)
                 if selected is not None:
                     self._cache[ot] = selected
             self._cache_spot_price = current_spot
@@ -131,8 +157,8 @@ class OptionSelector:
             logger.info(
                 "Option chain cache refreshed at spot=%.2f: CE=%s PE=%s",
                 current_spot,
-                self._cache.get("CE").instrument_key if "CE" in self._cache else None,
-                self._cache.get("PE").instrument_key if "PE" in self._cache else None,
+                self._cache.get("CE").symbol if "CE" in self._cache else None,
+                self._cache.get("PE").symbol if "PE" in self._cache else None,
             )
 
         return self._cache.get(option_type)

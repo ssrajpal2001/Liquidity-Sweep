@@ -6,7 +6,7 @@
 
 app:
   name: "liquidity-sweep-bot"
-  environment: "sandbox"       # sandbox | live — mirrors UPSTOX_SANDBOX in .env
+  environment: "paper"         # paper | live — mirrors PAPER_MODE in .env
   timezone: "Asia/Kolkata"
 
 capital:
@@ -15,15 +15,17 @@ capital:
   max_daily_loss_pct: 3.0      # hard stop for the day
   max_trades_per_day: 3
 
+# spot_key is the Fyers symbol format (NOT Upstox's instrument_key format).
+# NIFTY/SENSEX values below are the standard Fyers index symbols — double
+# check against Fyers' symbol master (https://public.fyers.in/sym_details/)
+# if either ever fails to subscribe.
 instruments:
   - name: "NIFTY"
-    spot_key: "NSE_INDEX|Nifty 50"
-    option_segment: "NSE_FO"
+    spot_key: "NSE:NIFTY50-INDEX"
     lot_size: 75
     strike_interval: 50        # points between listed strikes
   - name: "SENSEX"
-    spot_key: "BSE_INDEX|SENSEX"
-    option_segment: "BSE_FO"
+    spot_key: "BSE:SENSEX-INDEX"
     lot_size: 20
     strike_interval: 100
 

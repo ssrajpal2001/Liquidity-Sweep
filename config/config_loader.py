@@ -23,12 +23,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 
-REQUIRED_ENV_VARS = ["UPSTOX_API_KEY", "UPSTOX_API_SECRET", "UPSTOX_REDIRECT_URI"]
+REQUIRED_ENV_VARS = ["FYERS_CLIENT_ID", "FYERS_SECRET_KEY", "FYERS_REDIRECT_URI"]
 REQUIRED_YAML_SECTIONS = [
     "app", "capital", "instruments", "timeframes",
     "session", "option_selection", "execution", "risk",
 ]
-REQUIRED_INSTRUMENT_KEYS = ("name", "spot_key", "option_segment", "lot_size", "strike_interval")
+REQUIRED_INSTRUMENT_KEYS = ("name", "spot_key", "lot_size", "strike_interval")
 
 
 class ConfigError(RuntimeError):
@@ -38,10 +38,10 @@ class ConfigError(RuntimeError):
 @dataclass(frozen=True)
 class EnvConfig:
     """Secrets and environment-level settings, sourced from .env."""
-    api_key: str
-    api_secret: str
+    client_id: str
+    secret_key: str
     redirect_uri: str
-    sandbox: bool
+    paper_mode: bool
     auth_code: Optional[str]
     token_store_path: Path
 
@@ -114,18 +114,18 @@ def _load_env(env_path: Path) -> EnvConfig:
             f". Copy {PROJECT_ROOT / '.env.example'} to .env and fill these in."
         )
 
-    sandbox = _str_to_bool(os.getenv("UPSTOX_SANDBOX", "true"))
+    paper_mode_val = _str_to_bool(os.getenv("PAPER_MODE", "true"))
 
     token_store_path = Path(os.getenv("TOKEN_STORE_PATH", "secrets/token_store.json"))
     if not token_store_path.is_absolute():
         token_store_path = PROJECT_ROOT / token_store_path
 
     return EnvConfig(
-        api_key=os.environ["UPSTOX_API_KEY"],
-        api_secret=os.environ["UPSTOX_API_SECRET"],
-        redirect_uri=os.environ["UPSTOX_REDIRECT_URI"],
-        sandbox=sandbox,
-        auth_code=os.getenv("UPSTOX_AUTH_CODE") or None,
+        client_id=os.environ["FYERS_CLIENT_ID"],
+        secret_key=os.environ["FYERS_SECRET_KEY"],
+        redirect_uri=os.environ["FYERS_REDIRECT_URI"],
+        paper_mode=paper_mode_val,
+        auth_code=os.getenv("FYERS_AUTH_CODE") or None,
         token_store_path=token_store_path,
     )
 
@@ -144,9 +144,9 @@ def _validate_yaml(raw: dict[str, Any]) -> None:
             raise ConfigError(f"Instrument entry {inst} missing key(s): {missing_keys}")
 
     env_name = raw["app"].get("environment")
-    if env_name not in ("sandbox", "live"):
+    if env_name not in ("paper", "live"):
         raise ConfigError(
-            f"app.environment must be 'sandbox' or 'live', got: {env_name!r}"
+            f"app.environment must be 'paper' or 'live', got: {env_name!r}"
         )
 
     risk_pct = raw["capital"].get("risk_per_trade_pct")
@@ -172,9 +172,9 @@ def load_settings(
     env = _load_env(env_path)
 
     logger.info(
-        "Configuration loaded: environment=%s sandbox=%s instruments=%s",
+        "Configuration loaded: environment=%s paper_mode=%s instruments=%s",
         raw["app"]["environment"],
-        env.sandbox,
+        env.paper_mode,
         [i["name"] for i in raw["instruments"]],
     )
     return Settings(raw=raw, env=env)
@@ -184,6 +184,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     settings = load_settings()
     print(f"Environment : {settings.environment}")
-    print(f"Sandbox     : {settings.env.sandbox}")
+    print(f"Paper mode  : {settings.env.paper_mode}")
     print(f"Instruments : {[i['name'] for i in settings.instruments]}")
     print(f"Token store : {settings.env.token_store_path}")
