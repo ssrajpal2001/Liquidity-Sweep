@@ -20,7 +20,7 @@ import logging
 from typing import Optional
 
 from auth.auth import FyersAuth, ReauthRequired
-from brokers.base import BrokerAdapter, ConnectionCheckResult, OptionLeg, OrderResult, ReconnectCallback, TickCallback
+from brokers.base import AuthType, BrokerAdapter, ConnectionCheckResult, OptionLeg, OrderResult, ReconnectCallback, TickCallback
 from data_feed.fyers_rest_client import FyersRestClient
 from data_feed.fyers_ws_client import FyersWSClient
 from execution.expiry_resolver import ExpiryResolver
@@ -60,6 +60,10 @@ class FyersBrokerAdapter(BrokerAdapter):
     @property
     def broker_name(self) -> str:
         return "fyers"
+
+    @property
+    def auth_type(self):
+        return AuthType.OAUTH_REDIRECT
 
     @classmethod
     def required_credential_fields(cls) -> list[tuple[str, str, bool]]:

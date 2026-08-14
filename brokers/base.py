@@ -29,10 +29,16 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Optional
 
 TickCallback = Callable[[str, float], None]        # (symbol, ltp)
 ReconnectCallback = Callable[[], None]
+
+
+class AuthType(str, Enum):
+    OAUTH_REDIRECT = "oauth_redirect"          # Fyers, Upstox, Zerodha — browser login required
+    DIRECT_CREDENTIALS = "direct_credentials"  # AngelOne (TOTP), some others — bot can log in headlessly
 
 
 @dataclass
@@ -80,15 +86,28 @@ class BrokerAdapter(ABC):
         adding a broker never requires touching the UI code, just
         returning the right fields here."""
 
-    # -- auth --------------------------------------------------------------
+    @property
     @abstractmethod
-    def build_login_url(self, state: Optional[str] = None) -> str:
-        ...
+    def auth_type(self) -> AuthType:
+        """Determines which login method the web UI calls: OAUTH_REDIRECT
+        brokers use build_login_url()/exchange_code() (a browser round
+        trip); DIRECT_CREDENTIALS brokers use login() (no browser needed
+        at all, credentials already in hand from the vault)."""
 
-    @abstractmethod
+    # -- auth: OAUTH_REDIRECT brokers implement these -----------------------------
+    def build_login_url(self, state: Optional[str] = None) -> str:
+        raise NotImplementedError(f"{self.broker_name} does not use OAuth redirect login.")
+
     def exchange_code(self, code_or_redirect_url: str) -> None:
-        """Completes the login, persists the token internally. Raises
-        AuthError (or a broker-specific subclass) on failure."""
+        raise NotImplementedError(f"{self.broker_name} does not use OAuth redirect login.")
+
+    # -- auth: DIRECT_CREDENTIALS brokers implement this instead ------------------
+    def login(self) -> ConnectionCheckResult:
+        """Logs in directly using credentials already stored in the vault
+        (e.g. AngelOne: client_code + PIN + a fresh TOTP code derived from
+        a stored secret) — no browser redirect. Only meaningful when
+        auth_type is DIRECT_CREDENTIALS."""
+        raise NotImplementedError(f"{self.broker_name} uses OAuth redirect login instead — call build_login_url().")
 
     @abstractmethod
     def is_authenticated(self) -> bool:

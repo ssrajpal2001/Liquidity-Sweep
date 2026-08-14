@@ -103,10 +103,19 @@ python run_webapp.py
 
 This prints a URL (`http://<ec2-public-ip>:5000/login`) — open it in a
 browser. Log in, pick a broker from the list, enter that broker's
-credentials (client_id/secret_key/redirect_uri for Fyers — the form
-fields are broker-specific, defined once per adapter), and hit
-**Connect**. That runs the real broker login in your browser and comes
-back here with a live-verified connection.
+credentials, and hit **Connect**.
+
+**Two connect flows, depending on the broker:**
+- **OAuth redirect** (Fyers, and future Zerodha/Upstox): Connect sends
+  your browser to the broker's own login page, which redirects back here
+  once you log in there.
+- **Direct credentials** (AngelOne): Connect logs in immediately, right
+  here, using the client code / PIN / TOTP secret you entered — no
+  browser redirect at all, since AngelOne's login doesn't require one.
+  This also means AngelOne can re-authenticate itself headlessly if a
+  session goes stale, with no daily manual step.
+
+Either way you land back on the dashboard with a live-verified connection.
 
 **Credentials never touch `.env`** — they're stored encrypted in
 `secrets/credentials.db` (Fernet, key from `WEBAPP_ENCRYPTION_KEY`).
@@ -163,25 +172,26 @@ the whole file back for review.
 
 ## 6. Known gaps to watch for
 
-- **Delta may not be available from Fyers' option chain API.** Multiple
-  community threads (2024-2026) ask whether Fyers' `optionchain()` reliably
-  returns Greeks at all. `execution/option_selector.py` tries real delta
-  first; if none comes back it falls back to nearest-strike-to-spot with
-  an assumed delta and logs `[DELTA_UNAVAILABLE_FALLBACK]`. If you see
-  that tag, the risk math (Spot Risk × Delta = Premium SL) is running on
-  an assumed delta, not a live one — worth checking your Fyers data plan
-  includes Greeks.
-- **Tick/message shape unverified live**: `data_feed/fyers_ws_client.py`'s
-  field expectations (`symbol`, `ltp`) come from real community sample
-  code, which is stronger than pure docs, but still hasn't been confirmed
-  against a live connection from this build environment (no network path
-  to Fyers here). Watch for `[Unrecognized tick shape]` warnings.
-- **Expiry response shape unverified live**: same caveat for
-  `execution/expiry_resolver.py`'s `expiryData` parsing — watch for
+- **Delta may not be available from Fyers' option chain API.** Not a problem anymore —
+  `execution/greeks_engine.py` computes Delta locally (Black-Scholes from the
+  option's own live LTP) for any strike a broker doesn't supply one for. Watch
+  for `[DELTA_COMPUTED_LOCALLY]` in logs — that's expected, not an error.
+- **AngelOne — two pieces genuinely unverified without a live account:**
+  - WebSocket tick field names (`token`, `last_traded_price`) — based on
+    community sample code, not an independently-confirmed live message.
+    Watch for `[Unrecognized AngelOne tick shape]`.
+  - Options trading-symbol format for `searchScrip()` — AngelOne's exact
+    weekly-options symbol convention has changed historically. Watch for
+    `[ANGELONE_SYMBOL_SEARCH_EMPTY]`. `nearest_expiry()` and the
+    instrument-master (token) lookup needed for `placeOrder`'s
+    `symboltoken` field are not yet implemented — flagged clearly in
+    `brokers/angelone_adapter.py`'s module docstring rather than guessed.
+- **Tick/message shape for Fyers unverified live**: same caveat as before,
+  watch for `[Unrecognized feed shape]`.
+- **Expiry response shape unverified live** for Fyers: watch for
   `[No expiryData in option chain response]`.
 - **REST resync on reconnect** logs a placeholder — historical-candle
-  backfill on WS reconnect isn't implemented yet, so a candle spanning a
-  disconnect may be based on partial data.
+  backfill on WS reconnect isn't implemented yet.
 
 ## 7. Run tests
 
@@ -201,8 +211,8 @@ breakeven → trailing stop → exit).
 ```
 config/          settings.yaml + config_loader.py + logging_setup.py    (done)
 auth/            auth.py — Fyers OAuth login/token lifecycle            (done)
-brokers/         base.py (BrokerAdapter interface), fyers_adapter.py,
-                 registry.py — the plug-and-play broker layer            (done)
+brokers/         base.py (BrokerAdapter interface, both auth styles),
+                 fyers_adapter.py, angelone_adapter.py, registry.py       (done — 2 brokers live)
 webapp/          app.py, credential_vault.py, templates/ — login,
                  per-broker credential form, OAuth connect toggle        (done, trading loop not yet wired to it)
 data_feed/       fyers_rest_client.py, fyers_ws_client.py,

@@ -20,10 +20,14 @@ from typing import Type
 
 from brokers.base import BrokerAdapter
 from brokers.fyers_adapter import FyersBrokerAdapter
+from brokers.angelone_adapter import AngelOneBrokerAdapter
 
 BROKER_REGISTRY: dict[str, Type[BrokerAdapter]] = {
     "fyers": FyersBrokerAdapter,
+    "angelone": AngelOneBrokerAdapter,
     # "upstox": UpstoxBrokerAdapter,   # re-add when brokers/upstox_adapter.py exists
+    # "zerodha": ZerodhaBrokerAdapter,
+    # "dhan": DhanBrokerAdapter,
 }
 
 

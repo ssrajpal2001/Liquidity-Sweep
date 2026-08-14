@@ -43,15 +43,18 @@ TOKEN_STORE_DIR = Path("secrets/tokens")
 
 
 def _build_env_like(fields: dict[str, str], token_store_path: Path) -> SimpleNamespace:
-    """FyersAuth/FyersRestClient only ever access attributes (client_id,
-    secret_key, redirect_uri, paper_mode, auth_code, token_store_path) —
-    they don't require a real config.config_loader.EnvConfig instance, so
-    a plain namespace built from vault-stored fields works without
-    touching auth.py at all."""
+    """FyersAuth/AngelOneBrokerAdapter/etc. only ever access attributes by
+    name (client_id, secret_key, redirect_uri for Fyers; api_key,
+    client_code, pin, totp_secret for AngelOne; whatever the next broker
+    needs) — they don't require a real config.config_loader.EnvConfig
+    instance. Building the namespace generically from whatever fields the
+    vault has for THIS broker (rather than hardcoding one broker's field
+    names) is what makes adding a broker not require touching this
+    function — a bug caught during testing when AngelOne's fields
+    (different from Fyers') hit a namespace that only had Fyers' three
+    attributes."""
     return SimpleNamespace(
-        client_id=fields.get("client_id"),
-        secret_key=fields.get("secret_key"),
-        redirect_uri=fields.get("redirect_uri"),
+        **fields,
         paper_mode=True,  # the web UI only ever toggles broker CONNECTION, not live trading
         auth_code=None,
         token_store_path=token_store_path,
@@ -173,7 +176,7 @@ def create_app() -> Flask:
             fields_spec=fields_spec, existing=existing,
         )
 
-    # -- connect (OAuth) toggle -----------------------------------------------
+    # -- connect (branches on auth_type) ---------------------------------------
     @app.route("/brokers/<broker_name>/connect")
     @login_required
     def broker_connect(broker_name: str):
@@ -183,6 +186,21 @@ def create_app() -> Flask:
         adapter = _adapter_for(session["user_id"], broker_name, v)
         if adapter is None:
             return redirect(url_for("broker_credentials", broker_name=broker_name))
+
+        from brokers.base import AuthType
+
+        if adapter.auth_type == AuthType.DIRECT_CREDENTIALS:
+            # No browser round trip needed — log in right here with the
+            # already-stored credentials and show the result immediately.
+            check = adapter.login()
+            v.set_connected(session["user_id"], broker_name, check.ok)
+            logger.info(
+                "[BROKER_CONNECT_%s] user=%s broker=%s (direct login) user_name=%s",
+                "OK" if check.ok else "FAILED", session["user_id"], broker_name, check.user_name,
+            )
+            if not check.ok:
+                return render_template("error.html", message=f"Login failed: {check.detail}"), 400
+            return redirect(url_for("dashboard"))
 
         state = secrets.token_urlsafe(16)
         session[f"oauth_state_{broker_name}"] = state

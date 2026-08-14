@@ -116,3 +116,47 @@ def test_logout_clears_session(client):
     r = client.get("/", follow_redirects=False)
     assert r.status_code == 302
     assert "/login" in r.headers["Location"]
+
+
+def test_angelone_connect_uses_direct_login_not_oauth_redirect(client, monkeypatch):
+    """Regression test for a real bug: _build_env_like() was hardcoded to
+    Fyers' field names (client_id/secret_key/redirect_uri), so AngelOne's
+    different fields (api_key/client_code/pin/totp_secret) silently
+    weren't passed through, breaking login with an AttributeError. This
+    proves a second broker with a completely different credential shape
+    and a completely different auth mechanism (direct TOTP login, no
+    browser redirect) works through the same generic UI code."""
+    import pyotp
+    from unittest.mock import patch
+
+    _login(client)
+    totp_secret = pyotp.random_base32()
+    client.post("/brokers/angelone/credentials", data={
+        "api_key": "test_key", "client_code": "A123456",
+        "pin": "1234", "totp_secret": totp_secret,
+    })
+
+    with patch("brokers.angelone_adapter.SmartConnect") as MockSmartConnect:
+        MockSmartConnect.return_value.generateSession.return_value = {
+            "status": True,
+            "data": {
+                "jwtToken": "jwt", "refreshToken": "r", "feedToken": "f",
+                "name": "Test User", "clientcode": "A123456",
+            },
+        }
+        r = client.get("/brokers/angelone/connect", follow_redirects=False)
+
+    # Direct-credential brokers go straight to the dashboard — no OAuth
+    # provider URL in the redirect, unlike Fyers' /brokers/fyers/connect.
+    assert r.status_code == 302
+    assert r.headers["Location"] in ("/", "http://localhost/")
+
+    r = client.get("/")
+    assert b"Connected" in r.data
+
+
+def test_both_fyers_and_angelone_appear_in_broker_list(client):
+    _login(client)
+    r = client.get("/")
+    assert b"fyers" in r.data
+    assert b"angelone" in r.data
