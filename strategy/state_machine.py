@@ -190,8 +190,14 @@ class InstrumentStateMachine:
             )
             return None
 
-        now = datetime.now()
-        window_ok, window_reason = is_within_trading_window(now, self.session_config)
+        # Use the candle's OWN timestamp, not wall-clock time — using
+        # datetime.now() here was a real bug: it made the time-window
+        # filter check the moment the backtest was RUN, not the moment
+        # the signal actually occurred in history, silently discarding
+        # every backtested signal regardless of its real historical time.
+        # For live trading this is a no-op change (a live candle's
+        # open_time is already effectively "now").
+        window_ok, window_reason = is_within_trading_window(entry_candle.open_time, self.session_config)
         if not window_ok:
             logger.info("%s: signal discarded — %s", self.instrument_key, window_reason)
             return None
