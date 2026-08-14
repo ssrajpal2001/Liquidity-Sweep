@@ -1,15 +1,25 @@
 # liquidity-sweep-bot
 
 Automated Nifty/Sensex index-option trading bot based on Spot liquidity
-sweeps (signal on Spot, execute on Options), using **Fyers** as the data
-feeder and broker. See the full architecture in the accompanying
+sweeps (signal on Spot, execute on Options), supporting multiple brokers
+(Fyers, AngelOne, more to come) via a plug-and-play adapter interface.
+See the full architecture in the accompanying
 `upstox_liquidity_sweep_bot_workplan.md` and `workflow_diagram.mermaid`
-(filenames predate the Fyers switch; the logic they describe is unchanged
-and broker-agnostic — only the data feeder/broker layer changed).
+(filenames predate the broker abstraction; the strategy logic they
+describe is unchanged and broker-agnostic).
 
-**Status:** Phases 0-8 are implemented and tested (36 passing tests).
-Phase 5.5 (dashboard) and Phase 9 (fuller backtest fill simulation) are
-not yet built.
+**Status:** Phases 0-8 are implemented and tested (95 passing tests),
+plus a web UI for registration/login/broker credential management/
+connect. Phase 5.5 (dashboard) and Phase 9 (fuller backtest fill
+simulation) are not yet built, and the web UI's "Connect" doesn't yet
+start the actual trading pipeline (see section 4).
+
+**Two ways to run this — pick based on what you're doing:**
+- **Web UI** (`python run_webapp.py`) — register an account, add broker
+  credentials through a form, connect. No `.env` setup at all. This is
+  the multi-client-friendly path. See section 4.
+- **Direct** (`python main.py`) — a single hardcoded broker (Fyers)
+  configured entirely via `.env`, no web UI involved. See section 5.
 
 ## 1. Setup
 
@@ -19,7 +29,11 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Create your local secrets file:
+If you're using the **web UI**, skip straight to section 4 — no `.env`
+needed.
+
+If you're running `main.py` **directly** (single Fyers broker, no web
+UI), create `.env`:
 
 ```bash
 cp .env.example .env
@@ -41,7 +55,7 @@ real credentials or tokens.**
 Non-secret settings (capital, risk %, instruments, time windows, etc.) live
 in `config/settings.yaml` and are safe to commit.
 
-## 2. Daily login
+## 2. Daily login (only for the direct `main.py` path)
 
 Fyers access tokens are valid for about a day, and this project checks
 validity live (via a `get_profile()` call) rather than trusting a fixed
@@ -82,28 +96,28 @@ by Fyers:
   between `settings.yaml` and `.env` stops the bot rather than guessing
   which one you meant.
 
-## 4. Web UI — login, broker credentials, connect toggle
+## 4. Web UI — register, log in, pick a broker, connect
 
 ```bash
-# One-time setup:
-python -c "import secrets; print(secrets.token_hex(32))"
-# -> paste into .env as WEBAPP_SECRET_KEY
-
-python -c "from webapp.credential_vault import generate_encryption_key; print(generate_encryption_key())"
-# -> paste into .env as WEBAPP_ENCRYPTION_KEY (back this up separately — losing it
-#    makes every stored broker credential permanently unreadable)
-
-python -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('your-password-here'))"
-# -> paste into .env as WEBAPP_ADMIN_PASSWORD_HASH
-# also set WEBAPP_ADMIN_USER in .env to whatever username you want
-
-# Run it:
 python run_webapp.py
 ```
 
-This prints a URL (`http://<ec2-public-ip>:5000/login`) — open it in a
-browser. Log in, pick a broker from the list, enter that broker's
-credentials, and hit **Connect**.
+That's it — **no `.env` setup required.** The two infra secrets it needs
+(Flask session key, vault encryption key) auto-generate into
+`secrets/webapp_secret.key` / `secrets/webapp_encryption.key` on first
+run and are reused forever after. Everything else — accounts, broker
+credentials, connection state — lives in `secrets/credentials.db`,
+created automatically too.
+
+This prints a URL (`http://<ec2-public-ip>:5000/register`) — open it in
+a browser:
+
+1. **Register** a new account (username + password, 8+ characters).
+2. **Log in.**
+3. Dashboard lists brokers from the registry (`fyers`, `angelone`, more
+   as they're added). Pick one, **Add credentials** — the form fields
+   are broker-specific, defined once per adapter.
+4. Hit **Connect**.
 
 **Two connect flows, depending on the broker:**
 - **OAuth redirect** (Fyers, and future Zerodha/Upstox): Connect sends
@@ -111,14 +125,20 @@ credentials, and hit **Connect**.
   once you log in there.
 - **Direct credentials** (AngelOne): Connect logs in immediately, right
   here, using the client code / PIN / TOTP secret you entered — no
-  browser redirect at all, since AngelOne's login doesn't require one.
-  This also means AngelOne can re-authenticate itself headlessly if a
-  session goes stale, with no daily manual step.
+  browser redirect at all. This also means AngelOne can re-authenticate
+  itself headlessly if a session goes stale, with no daily manual step.
 
-Either way you land back on the dashboard with a live-verified connection.
+Either way you land back on the dashboard with a live-verified
+connection, polled every 10s.
+
+**Multiple clients:** each registered account only ever sees its own
+broker credentials and connection state — verified by a cross-user
+isolation test (`tests/test_webapp_flow.py`).
 
 **Credentials never touch `.env`** — they're stored encrypted in
-`secrets/credentials.db` (Fernet, key from `WEBAPP_ENCRYPTION_KEY`).
+`secrets/credentials.db` (Fernet, key from `secrets/webapp_encryption.key`
+— back that file up separately; losing it makes every stored credential
+permanently unreadable).
 
 ### HTTPS note — read this before trying to connect a broker
 

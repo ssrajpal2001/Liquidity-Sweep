@@ -1,41 +1,42 @@
 """
 webapp/app.py
 
-The web UI you described: run a command, open a URL, log in, pick a
-broker from a list, enter that broker's credentials (stored encrypted in
-the vault, never in .env), and flip a connect toggle that runs the real
-OAuth flow — Fyers' own login page, redirect back to us, token stored.
+The web UI: run a command, open a URL, register a new client account,
+log in, pick a broker from a list, enter that broker's credentials
+(stored encrypted in the vault, never in .env), and flip a connect
+toggle that either runs the real OAuth flow (Fyers) or logs in directly
+(AngelOne's TOTP-based login needs no browser round trip).
 
-Scope note, stated plainly: this delivers login + credential management +
-real OAuth connect/disconnect + a live connectivity check ("see what's
-happening" = confirmed authenticated + reachable). It does NOT yet start
-the actual tick/strategy/order pipeline (main.py's TradingSession) from
-this UI — wiring "toggle on" to "now trading" is the natural next step,
-not something to bolt on without equal care.
+Zero required .env setup: the two infra secrets this needs (Flask
+session key, vault encryption key) auto-generate into local files on
+first run — see webapp/secrets_bootstrap.py. Everything else — user
+accounts, broker credentials, connection state — lives in
+secrets/credentials.db.
 
-Auth model: one shared admin login for now (WEBAPP_ADMIN_USER /
-WEBAPP_ADMIN_PASSWORD_HASH in .env), with all data already isolated by
-user_id in the vault. Swapping in real per-client accounts later is a
-users table + registration flow — this UI's structure doesn't need to
-change for that, just the login route.
+Scope note, stated plainly: this delivers registration + login +
+credential management + connect/disconnect (OAuth or direct) + a live
+connectivity check ("see what's happening" = confirmed authenticated +
+reachable). It does NOT yet start the actual tick/strategy/order
+pipeline (main.py's TradingSession) from this UI — wiring "toggle on" to
+"now trading" is the natural next step, not something to bolt on without
+equal care.
 """
 from __future__ import annotations
 
 import functools
 import logging
-import os
 import secrets
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
 
-from flask import Flask, redirect, render_template, request, session, url_for
-from werkzeug.security import check_password_hash
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 
-from brokers.base import ConnectionCheckResult
+from brokers.base import AuthType, ConnectionCheckResult
 from brokers.registry import available_brokers, get_adapter_class
 from webapp import credential_vault as credential_vault_module
-from webapp.credential_vault import CredentialVault, VaultError
+from webapp.credential_vault import CredentialVault
+from webapp.secrets_bootstrap import get_or_create_encryption_key, get_or_create_secret_key
+from webapp.user_store import UserStore, UserStoreError
 
 logger = logging.getLogger(__name__)
 
@@ -73,23 +74,15 @@ def _adapter_for(user_id: str, broker_name: str, vault: CredentialVault):
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.secret_key = os.environ.get("WEBAPP_SECRET_KEY") or secrets.token_hex(32)
-    if not os.environ.get("WEBAPP_SECRET_KEY"):
-        logger.warning(
-            "WEBAPP_SECRET_KEY not set — using a random key for this process only. "
-            "Sessions will not survive a restart. Set WEBAPP_SECRET_KEY in .env for production use."
-        )
+    # Zero required .env setup: both infra secrets auto-generate into
+    # local files on first run and are reused forever after — see
+    # webapp/secrets_bootstrap.py's docstring for why these two
+    # specifically can't live in the database itself.
+    app.secret_key = get_or_create_secret_key()
 
-    encryption_key = os.environ.get("WEBAPP_ENCRYPTION_KEY", "")
-    # Read db_path via the module attribute, not a bound default, so tests
-    # (or any caller) reassigning credential_vault_module.DB_PATH before
-    # create_app() actually take effect — see credential_vault.py's
-    # __init__ docstring for why the naive default-parameter approach
-    # silently doesn't work here.
-    vault = CredentialVault(encryption_key, db_path=credential_vault_module.DB_PATH) if encryption_key else None
-
-    admin_user = os.environ.get("WEBAPP_ADMIN_USER")
-    admin_password_hash = os.environ.get("WEBAPP_ADMIN_PASSWORD_HASH")
+    encryption_key = get_or_create_encryption_key()
+    vault = CredentialVault(encryption_key, db_path=credential_vault_module.DB_PATH)
+    users = UserStore()
 
     def login_required(view):
         @functools.wraps(view)
@@ -99,33 +92,34 @@ def create_app() -> Flask:
             return view(*args, **kwargs)
         return wrapped
 
-    def _vault_or_error():
-        if vault is None:
-            return None, render_template(
-                "error.html",
-                message="WEBAPP_ENCRYPTION_KEY is not set in .env. Generate one with:\n"
-                        'python -c "from webapp.credential_vault import generate_encryption_key; '
-                        'print(generate_encryption_key())"',
-            )
-        return vault, None
+    # -- auth: real per-client registration + login ---------------------------
+    @app.route("/register", methods=["GET", "POST"])
+    def register():
+        error = None
+        if request.method == "POST":
+            try:
+                users.register(
+                    request.form.get("username", ""),
+                    request.form.get("password", ""),
+                    request.form.get("confirm_password", ""),
+                )
+            except UserStoreError as exc:
+                error = str(exc)
+            else:
+                session["user_id"] = request.form.get("username", "").strip()
+                return redirect(url_for("dashboard"))
+        return render_template("register.html", error=error)
 
-    # -- auth --------------------------------------------------------------
     @app.route("/login", methods=["GET", "POST"])
     def login():
         error = None
         if request.method == "POST":
             username = request.form.get("username", "")
             password = request.form.get("password", "")
-            if (
-                admin_user and admin_password_hash
-                and username == admin_user
-                and check_password_hash(admin_password_hash, password)
-            ):
-                session["user_id"] = username
+            if users.verify(username, password):
+                session["user_id"] = username.strip()
                 return redirect(url_for("dashboard"))
             error = "Invalid username or password."
-            if not admin_user or not admin_password_hash:
-                error = "WEBAPP_ADMIN_USER / WEBAPP_ADMIN_PASSWORD_HASH not configured in .env."
         return render_template("login.html", error=error)
 
     @app.route("/logout")
@@ -137,20 +131,14 @@ def create_app() -> Flask:
     @app.route("/")
     @login_required
     def dashboard():
-        v, err = _vault_or_error()
-        if err:
-            return err
         broker_names = available_brokers()
-        status = v.list_broker_status(session["user_id"], broker_names)
+        status = vault.list_broker_status(session["user_id"], broker_names)
         return render_template("dashboard.html", brokers=broker_names, status=status)
 
     # -- credentials ---------------------------------------------------------
     @app.route("/brokers/<broker_name>/credentials", methods=["GET", "POST"])
     @login_required
     def broker_credentials(broker_name: str):
-        v, err = _vault_or_error()
-        if err:
-            return err
         try:
             adapter_class = get_adapter_class(broker_name)
         except ValueError as exc:
@@ -159,7 +147,7 @@ def create_app() -> Flask:
         fields_spec = adapter_class.required_credential_fields()
 
         if request.method == "POST":
-            existing_now = v.get_credentials(session["user_id"], broker_name) or {}
+            existing_now = vault.get_credentials(session["user_id"], broker_name) or {}
             values = {}
             for name, _, is_secret in fields_spec:
                 submitted = request.form.get(name, "")
@@ -167,10 +155,10 @@ def create_app() -> Flask:
                     values[name] = existing_now[name]  # blank secret field = keep existing value
                 else:
                     values[name] = submitted
-            v.save_credentials(session["user_id"], broker_name, values)
+            vault.save_credentials(session["user_id"], broker_name, values)
             return redirect(url_for("dashboard"))
 
-        existing = v.get_credentials(session["user_id"], broker_name) or {}
+        existing = vault.get_credentials(session["user_id"], broker_name) or {}
         return render_template(
             "credentials_form.html", broker_name=broker_name,
             fields_spec=fields_spec, existing=existing,
@@ -180,20 +168,15 @@ def create_app() -> Flask:
     @app.route("/brokers/<broker_name>/connect")
     @login_required
     def broker_connect(broker_name: str):
-        v, err = _vault_or_error()
-        if err:
-            return err
-        adapter = _adapter_for(session["user_id"], broker_name, v)
+        adapter = _adapter_for(session["user_id"], broker_name, vault)
         if adapter is None:
             return redirect(url_for("broker_credentials", broker_name=broker_name))
-
-        from brokers.base import AuthType
 
         if adapter.auth_type == AuthType.DIRECT_CREDENTIALS:
             # No browser round trip needed — log in right here with the
             # already-stored credentials and show the result immediately.
             check = adapter.login()
-            v.set_connected(session["user_id"], broker_name, check.ok)
+            vault.set_connected(session["user_id"], broker_name, check.ok)
             logger.info(
                 "[BROKER_CONNECT_%s] user=%s broker=%s (direct login) user_name=%s",
                 "OK" if check.ok else "FAILED", session["user_id"], broker_name, check.user_name,
@@ -211,10 +194,7 @@ def create_app() -> Flask:
     @app.route("/brokers/<broker_name>/callback")
     @login_required
     def broker_callback(broker_name: str):
-        v, err = _vault_or_error()
-        if err:
-            return err
-        adapter = _adapter_for(session["user_id"], broker_name, v)
+        adapter = _adapter_for(session["user_id"], broker_name, vault)
         if adapter is None:
             return render_template("error.html", message="No credentials saved for this broker."), 400
 
@@ -225,7 +205,7 @@ def create_app() -> Flask:
             return render_template("error.html", message=f"Connection failed: {exc}"), 400
 
         check: ConnectionCheckResult = adapter.test_connection()
-        v.set_connected(session["user_id"], broker_name, check.ok)
+        vault.set_connected(session["user_id"], broker_name, check.ok)
         logger.info(
             "[BROKER_CONNECT_%s] user=%s broker=%s user_name=%s",
             "OK" if check.ok else "FAILED", session["user_id"], broker_name, check.user_name,
@@ -235,10 +215,7 @@ def create_app() -> Flask:
     @app.route("/brokers/<broker_name>/disconnect")
     @login_required
     def broker_disconnect(broker_name: str):
-        v, err = _vault_or_error()
-        if err:
-            return err
-        v.set_connected(session["user_id"], broker_name, False)
+        vault.set_connected(session["user_id"], broker_name, False)
         token_path = TOKEN_STORE_DIR / f"{session['user_id']}__{broker_name}_token_store.json"
         if token_path.exists():
             token_path.unlink()
@@ -249,12 +226,7 @@ def create_app() -> Flask:
     @app.route("/brokers/<broker_name>/status")
     @login_required
     def broker_status(broker_name: str):
-        from flask import jsonify
-
-        v, err = _vault_or_error()
-        if err:
-            return {"error": "vault not configured"}, 500
-        adapter = _adapter_for(session["user_id"], broker_name, v)
+        adapter = _adapter_for(session["user_id"], broker_name, vault)
         if adapter is None or not adapter.is_authenticated():
             return jsonify({"connected": False, "detail": "Not connected."})
         check = adapter.test_connection()

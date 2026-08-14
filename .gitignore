@@ -4,6 +4,7 @@ secrets/*.json
 secrets/token_store.json
 secrets/*.db
 secrets/tokens/
+secrets/*.key
 
 # Python
 __pycache__/
