@@ -180,3 +180,86 @@ def test_required_credential_fields_include_totp_secret():
     assert "pin" in field_names
     assert "client_code" in field_names
     assert "api_key" in field_names
+
+
+# -- instrument-master-backed methods --------------------------------------
+
+SAMPLE_SCRIP_ROWS = [
+    {"token": "58784", "symbol": "NIFTY28OCT2524400CE", "name": "NIFTY", "expiry": "28OCT2025",
+     "strike": "2440000.000000", "lotsize": "75", "instrumenttype": "OPTIDX", "exch_seg": "NFO",
+     "tick_size": "5.000000"},
+    {"token": "58785", "symbol": "NIFTY28OCT2524400PE", "name": "NIFTY", "expiry": "28OCT2025",
+     "strike": "2440000.000000", "lotsize": "75", "instrumenttype": "OPTIDX", "exch_seg": "NFO",
+     "tick_size": "5.000000"},
+]
+
+
+def _adapter_with_seeded_master(tmp_path):
+    from execution.angelone_instrument_master import AngelOneInstrumentMaster
+    import json
+
+    cache_path = tmp_path / "scrip_cache.json"
+    cache_path.write_text(json.dumps(SAMPLE_SCRIP_ROWS))
+    adapter = AngelOneBrokerAdapter(_make_env(tmp_path), paper_mode=True)
+    adapter._instrument_master = AngelOneInstrumentMaster(cache_path=cache_path)
+    return adapter
+
+
+def test_nearest_expiry_uses_instrument_master(tmp_path):
+    from datetime import date
+    adapter = _adapter_with_seeded_master(tmp_path)
+
+    with patch("execution.angelone_instrument_master.date") as mock_date:
+        mock_date.today.return_value = date(2025, 10, 1)
+        mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+        expiry = adapter.nearest_expiry("NIFTY")
+
+    assert expiry == "28OCT2025"  # AngelOne's own DDMMMYYYY format
+
+
+def test_get_option_chain_returns_legs_with_correct_strikes(tmp_path):
+    adapter = _adapter_with_seeded_master(tmp_path)
+    adapter._smart = MagicMock()
+    adapter._smart.ltpData.return_value = {"data": {"ltp": 150.5}}
+
+    legs = adapter.get_option_chain("NIFTY", "28OCT2025")
+
+    assert len(legs) == 2
+    ce_leg = next(l for l in legs if l.option_type == "CE")
+    assert ce_leg.strike_price == 24400.0  # not 2440000 — the x100 fix carried through
+    assert ce_leg.ltp == 150.5
+    assert ce_leg.delta is None  # always None — computed locally via greeks_engine
+
+
+def test_get_option_chain_returns_empty_for_unknown_underlying(tmp_path):
+    adapter = _adapter_with_seeded_master(tmp_path)
+    adapter._smart = MagicMock()
+    legs = adapter.get_option_chain("BANKNIFTY", "28OCT2025")
+    assert legs == []
+
+
+def test_place_order_resolves_symboltoken_from_instrument_master(tmp_path):
+    adapter = _adapter_with_seeded_master(tmp_path)
+    adapter.paper_mode = False  # exercise the real order-building path
+    adapter._smart = MagicMock()
+    adapter._smart.placeOrder.return_value = "ORDER123"
+
+    result = adapter.place_entry_buy("NIFTY28OCT2524400CE", 75, 150.0, tag="test")
+
+    assert result.ok is True
+    assert result.order_id == "ORDER123"
+    call_args = adapter._smart.placeOrder.call_args[0][0]
+    assert call_args["symboltoken"] == "58784"
+    assert call_args["exchange"] == "NFO"
+
+
+def test_place_order_fails_cleanly_when_symbol_not_in_master(tmp_path):
+    adapter = _adapter_with_seeded_master(tmp_path)
+    adapter.paper_mode = False
+    adapter._smart = MagicMock()
+
+    result = adapter.place_entry_buy("UNKNOWN25AUG25000CE", 75, 150.0, tag="test")
+
+    assert result.ok is False
+    assert "symboltoken" in result.detail
+    adapter._smart.placeOrder.assert_not_called()  # never even attempted with a bad token

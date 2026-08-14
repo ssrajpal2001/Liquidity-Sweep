@@ -5,6 +5,7 @@ secrets/token_store.json
 secrets/*.db
 secrets/tokens/
 secrets/*.key
+secrets/angelone_scrip_master_cache.json
 
 # Python
 __pycache__/

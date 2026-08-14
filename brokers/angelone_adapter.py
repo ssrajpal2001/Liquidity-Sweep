@@ -14,16 +14,23 @@ no daily manual browser step. auth_type = DIRECT_CREDENTIALS; the web UI
 calls login() directly instead of the OAuth build_login_url()/
 exchange_code() pair.
 
-UNVERIFIED, NEEDS LIVE CONFIRMATION TOMORROW:
-1. WebSocket tick shape — SmartWebSocketV2's on_data callback shape
-   (field names for token/LTP) is based on community sample code, less
-   certain than Fyers' (which had a directly-confirmed 'ltp'/'symbol'
-   sample). Watch for [Unrecognized AngelOne tick shape] warnings.
-2. Options trading-symbol format for searchScrip() — AngelOne's exact
-   weekly-options symbol naming convention (date format, spacing) has
-   changed historically and isn't confirmed here. get_option_chain()
-   below documents the assumed format and logs clearly if a search
-   returns nothing, rather than silently trading the wrong contract.
+UNVERIFIED, NEEDS LIVE CONFIRMATION:
+- WebSocket tick shape — CONFIRMED LIVE (2026-08-14, market hours): real
+  messages have exactly the assumed 'token'/'last_traded_price' fields,
+  plus bonus 'exchange_timestamp' and 'sequence_number' not currently
+  used. See scripts/test_angelone_feed.py for the smoke test that
+  confirmed this.
+- Instrument-master-based symbol/expiry/strike resolution (nearest_
+  expiry, get_option_chain, order placement's symboltoken lookup) — the
+  scrip-master JSON schema and the "strike is stored x100" quirk are
+  confirmed against multiple independent, real forum-posted samples, and
+  the parsing logic is unit-tested against those exact samples. NOT yet
+  confirmed against a live download of the actual file (no network path
+  to angelbroking.com from the build environment) — run it once against
+  the real file before trusting it for real strikes.
+- Index SPOT tokens (KNOWN_INDEX_SPOT_TOKENS in angelone_instrument_
+  master.py) are NOT in the scrip master at all and are community-
+  reported, not independently verified — confirm before relying on them.
 
 Every strike's Delta is computed locally via execution/greeks_engine.py
 regardless — this adapter does not call AngelOne's optionGreek() endpoint
@@ -48,6 +55,7 @@ from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 from brokers.base import AuthType, BrokerAdapter, ConnectionCheckResult, OptionLeg, OrderResult, ReconnectCallback, TickCallback
+from execution.angelone_instrument_master import AngelOneInstrumentMaster
 from execution.greeks_engine import compute_delta_from_price
 
 logger = logging.getLogger(__name__)
@@ -117,6 +125,7 @@ class AngelOneBrokerAdapter(BrokerAdapter):
         self._last_message_at: Optional[float] = None
         self._on_tick: Optional[TickCallback] = None
         self._instrument_master_cache: Optional[list[dict]] = None
+        self._instrument_master = AngelOneInstrumentMaster()
 
     @property
     def broker_name(self) -> str:
@@ -316,50 +325,77 @@ class AngelOneBrokerAdapter(BrokerAdapter):
 
     # -- options & expiry --------------------------------------------------------
     def nearest_expiry(self, underlying_symbol: str) -> Optional[str]:
-        # AngelOne has no dedicated "list expiries" endpoint in this SDK —
-        # expiry resolution goes through the same instrument-master lookup
-        # as strike search (see get_option_chain's caveat). Returning None
-        # here signals "caller must resolve expiry externally" until the
-        # instrument-master integration is verified live.
-        logger.warning(
-            "AngelOne nearest_expiry() not implemented — needs the instrument "
-            "master file integration (see module docstring caveat #2)."
-        )
-        return None
+        """underlying_symbol here is AngelOne's `name` field value
+        directly ('NIFTY', 'SENSEX', etc.) — cross-broker symbol-config
+        mapping is a separate piece of work (see main.py refactor,
+        deferred deliberately). exch_seg defaults to NFO (NSE F&O);
+        SENSEX would need BFO — caller passes the right one via the
+        instrument's exchange, not hardcoded here.
+        Returns the expiry as AngelOne's own DDMMMYYYY string (what
+        get_option_chain below expects back), not normalized to ISO,
+        since it's only ever passed straight back into this same
+        adapter."""
+        exch_seg = "BFO" if underlying_symbol.upper() == "SENSEX" else "NFO"
+        try:
+            expiry_date = self._instrument_master.nearest_option_expiry(
+                underlying_symbol.upper(), exch_seg=exch_seg
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to resolve nearest expiry for %s", underlying_symbol)
+            return None
+        if expiry_date is None:
+            logger.warning(
+                "[ANGELONE_NO_EXPIRY_FOUND] No option expiries found for %s (exch_seg=%s) "
+                "in the instrument master.", underlying_symbol, exch_seg,
+            )
+            return None
+        return expiry_date.strftime("%d%b%Y").upper()  # e.g. "28OCT2025", matches the master's own format
 
     def get_option_chain(self, underlying_symbol: str, expiry: str) -> list[OptionLeg]:
         smart = self._get_smart()
         if smart is None:
             return []
+
+        exch_seg = "BFO" if underlying_symbol.upper() == "SENSEX" else "NFO"
         try:
-            result = smart.searchScrip("NFO", underlying_symbol)
-        except Exception:  # noqa: BLE001
-            logger.exception("AngelOne searchScrip failed for %s", underlying_symbol)
+            expiry_date = datetime.strptime(expiry, "%d%b%Y").date()
+        except ValueError:
+            logger.error("get_option_chain: could not parse expiry '%s' (expected DDMMMYYYY).", expiry)
             return []
 
-        if not result or not result.get("status"):
+        try:
+            scrip_entries = self._instrument_master.strikes_for_expiry(
+                underlying_symbol.upper(), expiry_date, exch_seg=exch_seg
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to load strikes for %s %s", underlying_symbol, expiry)
+            return []
+
+        if not scrip_entries:
             logger.warning(
-                "[ANGELONE_SYMBOL_SEARCH_EMPTY] searchScrip('NFO', %s) returned nothing — "
-                "the assumed symbol-naming convention (see module docstring caveat #2) "
-                "likely needs adjusting once tested against a live account.",
-                underlying_symbol,
+                "[ANGELONE_SYMBOL_SEARCH_EMPTY] No strikes found for %s expiry=%s (exch_seg=%s) "
+                "in the instrument master — check the underlying name matches AngelOne's "
+                "'name' field exactly (e.g. 'NIFTY', not 'NIFTY50').",
+                underlying_symbol, expiry, exch_seg,
             )
             return []
 
         legs: list[OptionLeg] = []
-        for row in result.get("data", []):
-            trading_symbol = row.get("tradingsymbol", "")
-            if not trading_symbol.endswith(("CE", "PE")):
+        for entry in scrip_entries:
+            option_type = entry.symbol[-2:]
+            if option_type not in ("CE", "PE"):
                 continue
-            option_type = trading_symbol[-2:]
             try:
-                ltp_resp = smart.ltpData("NFO", trading_symbol, row.get("symboltoken"))
+                ltp_resp = smart.ltpData(exch_seg, entry.symbol, entry.token)
                 ltp = float(ltp_resp["data"]["ltp"])
             except Exception:  # noqa: BLE001
                 continue
             legs.append(OptionLeg(
-                symbol=trading_symbol, strike_price=0.0,  # strike parsed from symbol if needed by caller
-                option_type=option_type, ltp=ltp, delta=None,  # always None — computed locally, see docstring
+                symbol=entry.symbol, strike_price=entry.strike,
+                option_type=option_type, ltp=ltp, delta=None,  # computed locally, see module docstring
+                expiry_epoch_seconds=datetime.combine(
+                    expiry_date, datetime.min.time(), tzinfo=IST
+                ).timestamp(),
             ))
         return legs
 
@@ -382,15 +418,19 @@ class AngelOneBrokerAdapter(BrokerAdapter):
         if smart is None:
             return OrderResult(ok=False, order_id=None, detail="Not authenticated.")
 
-        # symboltoken is required by AngelOne's placeOrder but not carried
-        # on our normalized `symbol` string — this needs the same
-        # instrument-master lookup flagged in get_option_chain(). Left as
-        # an explicit TODO rather than silently omitted.
+        entry = self._instrument_master.find_by_symbol(symbol)
+        if entry is None:
+            return OrderResult(
+                ok=False, order_id=None,
+                detail=f"Could not resolve symboltoken for '{symbol}' in the instrument master.",
+            )
+
         order_params = {
             "variety": "NORMAL",
             "tradingsymbol": symbol,
+            "symboltoken": entry.token,
             "transactiontype": transaction_type,
-            "exchange": "NFO",
+            "exchange": entry.exch_seg,
             "ordertype": "LIMIT",
             "producttype": "INTRADAY",
             "duration": "DAY",

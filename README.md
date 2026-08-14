@@ -196,16 +196,20 @@ the whole file back for review.
   `execution/greeks_engine.py` computes Delta locally (Black-Scholes from the
   option's own live LTP) for any strike a broker doesn't supply one for. Watch
   for `[DELTA_COMPUTED_LOCALLY]` in logs — that's expected, not an error.
-- **AngelOne — two pieces genuinely unverified without a live account:**
-  - WebSocket tick field names (`token`, `last_traded_price`) — based on
-    community sample code, not an independently-confirmed live message.
-    Watch for `[Unrecognized AngelOne tick shape]`.
-  - Options trading-symbol format for `searchScrip()` — AngelOne's exact
-    weekly-options symbol convention has changed historically. Watch for
-    `[ANGELONE_SYMBOL_SEARCH_EMPTY]`. `nearest_expiry()` and the
-    instrument-master (token) lookup needed for `placeOrder`'s
-    `symboltoken` field are not yet implemented — flagged clearly in
-    `brokers/angelone_adapter.py`'s module docstring rather than guessed.
+- **AngelOne — status after live verification (2026-08-14):**
+  - WebSocket tick feed: **confirmed working live** (see
+    `scripts/test_angelone_feed.py` output) — `token`/`last_traded_price`
+    fields are exactly as assumed.
+  - Option-chain/expiry/order-token resolution now goes through
+    `execution/angelone_instrument_master.py`, which downloads and caches
+    AngelOne's public scrip-master file. The JSON schema and the
+    "strike is stored ×100" quirk are confirmed against multiple
+    independent real samples and unit-tested against those exact
+    samples — but the actual live download (network path to
+    angelbroking.com) hasn't been exercised from this build environment.
+    Run it once against the real file before trusting real strikes.
+  - Index spot tokens (`KNOWN_INDEX_SPOT_TOKENS`) are community-reported,
+    not independently verified — confirm before relying on them.
 - **Tick/message shape for Fyers unverified live**: same caveat as before,
   watch for `[Unrecognized feed shape]`.
 - **Expiry response shape unverified live** for Fyers: watch for
