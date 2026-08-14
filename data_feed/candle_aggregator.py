@@ -72,16 +72,17 @@ def _bucket_start(ts: datetime, minutes: int) -> datetime:
     75-minute (and any other non-divisor of 555) actually changes.
     """
     ts = ts.astimezone(IST)
-    minutes_since_midnight = ts.hour * 60 + ts.minute
+    midnight = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes_since_midnight = (ts - midnight).total_seconds() / 60
     offset = minutes_since_midnight - SESSION_START_MINUTES
     bucket_index = offset // minutes
     bucket_start_minutes = SESSION_START_MINUTES + bucket_index * minutes
-    return ts.replace(
-        hour=bucket_start_minutes // 60,
-        minute=bucket_start_minutes % 60,
-        second=0,
-        microsecond=0,
-    )
+    # timedelta arithmetic (not ts.replace(hour=..., minute=...)) so a
+    # bucket that starts before midnight or past 24:00 rolls the date
+    # correctly instead of raising ValueError('hour must be in 0..23') —
+    # live ticks only ever arrive during market hours so this never
+    # mattered there, but backtest/off-hours data can easily hit it.
+    return midnight + timedelta(minutes=bucket_start_minutes)
 
 
 class TimeframeAggregator:

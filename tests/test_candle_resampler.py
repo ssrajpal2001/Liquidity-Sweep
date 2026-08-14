@@ -59,3 +59,17 @@ def test_candles_are_in_chronological_order():
     result = resample_candles(raw, "NIFTY", target_minutes=5)
     for i in range(len(result) - 1):
         assert result[i].open_time < result[i + 1].open_time
+
+
+def test_resampling_off_hours_data_does_not_crash():
+    """Regression test for a real bug: timestamps outside market hours
+    (or, as here, historical data that runs past midnight) used to raise
+    ValueError('hour must be in 0..23') because _bucket_start built the
+    bucket boundary with ts.replace(hour=..., minute=...), which can't
+    represent day rollover. Fixed with timedelta arithmetic instead. Live
+    ticks never hit this (market hours only), but backtests can."""
+    base = datetime(2026, 8, 10, 3, 45, tzinfo=timezone.utc).timestamp()  # 09:15 IST
+    # 600 minutes runs well past market close and across midnight.
+    raw = [_minute_candle(base, i, 25000) for i in range(600)]
+    result = resample_candles(raw, "NIFTY", target_minutes=75)  # must not raise
+    assert len(result) > 0

@@ -180,6 +180,10 @@ python -m backtest.run_backtest --broker fyers --instrument NIFTY --from 2026-08
 
 # Using web-UI-saved credentials instead of .env:
 python -m backtest.run_backtest --broker fyers --username ssrajpal2001 --instrument NIFTY
+
+# AngelOne works too (--username required — AngelOne credentials only
+# live in the vault, there's no .env fallback path for it):
+python -m backtest.run_backtest --broker angelone --username ssrajpal2001 --instrument NIFTY
 ```
 
 Fetches real 1-minute historical candles from Fyers, resamples them to

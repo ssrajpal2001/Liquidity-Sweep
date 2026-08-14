@@ -46,6 +46,12 @@ logger = logging.getLogger("run_backtest")
 # Fyers symbol format, confirmed against real sample code.
 FYERS_SYMBOLS = {"NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX"}
 
+# AngelOne interval names, confirmed against real forum-posted request
+# samples: ONE_MINUTE, THREE_MINUTE, FIVE_MINUTE, TEN_MINUTE,
+# FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, ONE_DAY. No native 75-minute
+# here either — same 1-minute-then-resample approach as Fyers.
+ANGELONE_INTERVAL_1MIN = "ONE_MINUTE"
+
 DEFAULT_SESSION_CONFIG = {
     "high_probability_windows": [["09:15", "10:30"], ["13:15", "14:45"]],
     "blocked_window": [["11:30", "13:00"]],
@@ -98,29 +104,91 @@ def _fetch_fyers_1min_candles(model, symbol: str, from_date: date, to_date: date
     return [tuple(row) for row in response.get("candles", [])]
 
 
-def run(broker: str, instrument: str, username: str | None, from_date: date, to_date: date) -> None:
-    if instrument not in FYERS_SYMBOLS:
-        raise SystemExit(f"Unsupported instrument '{instrument}'. Use NIFTY or BANKNIFTY.")
-
-    if broker != "fyers":
+def _get_angelone_adapter(username: str | None):
+    if not username:
         raise SystemExit(
-            "Only --broker fyers is wired up for historical candle fetch right now "
-            "(AngelOne's getCandleData integration is a natural follow-up, not built "
-            "yet — the strategy/backtest code itself is broker-agnostic already)."
+            "--broker angelone requires --username (AngelOne credentials only "
+            "live in the web UI vault, there's no .env fallback for it)."
         )
+    from webapp.app import TOKEN_STORE_DIR, _build_env_like
+    from webapp.credential_vault import CredentialVault
+    from webapp.secrets_bootstrap import get_or_create_encryption_key
+    from brokers.angelone_adapter import AngelOneBrokerAdapter
+
+    vault = CredentialVault(get_or_create_encryption_key())
+    fields = vault.get_credentials(username, "angelone")
+    if fields is None:
+        raise SystemExit(f"No AngelOne credentials saved for '{username}'. Add them via the web UI first.")
+    env_like = _build_env_like(fields, TOKEN_STORE_DIR / f"{username}__angelone_token_store.json")
+    adapter = AngelOneBrokerAdapter(env_like, paper_mode=True)
+    # AngelOne's TOTP login is cheap and safe to re-run — no browser
+    # round trip needed, so just log in fresh rather than requiring the
+    # web UI to already show "Connected".
+    check = adapter.login()
+    if not check.ok:
+        raise SystemExit(f"AngelOne login failed: {check.detail}")
+    return adapter
+
+
+def _fetch_angelone_1min_candles(adapter, instrument: str, from_date: date, to_date: date) -> list[tuple]:
+    """Returns (epoch_seconds, open, high, low, close, volume) tuples.
+    Response shape confirmed against real forum-posted samples:
+    response['data'] = [[datetime_str, o, h, l, c, v], ...]."""
+    from execution.angelone_instrument_master import AngelOneInstrumentMaster
+
+    token = AngelOneInstrumentMaster.spot_index_token(instrument, "NSE")
+    if token is None:
+        raise SystemExit(
+            f"No known AngelOne spot index token for {instrument} — see "
+            "execution/angelone_instrument_master.py's KNOWN_INDEX_SPOT_TOKENS "
+            "(community-reported, not independently verified)."
+        )
+
+    smart = adapter._get_smart()  # noqa: SLF001 — script reaching into adapter internals deliberately
+    params = {
+        "exchange": "NSE", "symboltoken": token, "interval": ANGELONE_INTERVAL_1MIN,
+        "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
+        "todate": to_date.strftime("%Y-%m-%d 15:30"),
+    }
+    response = smart.getCandleData(params)
+    if not response or not response.get("status"):
+        logger.error("AngelOne getCandleData failed for %s: %s", instrument, response)
+        return []
+
+    candles = []
+    for row in response.get("data", []):
+        try:
+            dt_str, o, h, l, c, v = row
+            ts = datetime.fromisoformat(dt_str)
+            candles.append((ts.timestamp(), o, h, l, c, v))
+        except (ValueError, TypeError):
+            logger.warning("Skipping malformed AngelOne candle row: %s", row)
+    return candles
+
+
+def run(broker: str, instrument: str, username: str | None, from_date: date, to_date: date) -> None:
+    if instrument not in FYERS_SYMBOLS:  # same instrument set for both brokers
+        raise SystemExit(f"Unsupported instrument '{instrument}'. Use NIFTY or BANKNIFTY.")
 
     logger.info(
         "[BACKTEST_START] instrument=%s broker=%s range=%s to %s",
         instrument, broker, from_date, to_date,
     )
 
-    model = _get_fyers_model(username)
-    symbol = FYERS_SYMBOLS[instrument]
-    raw_candles = _fetch_fyers_1min_candles(model, symbol, from_date, to_date)
+    if broker == "fyers":
+        model = _get_fyers_model(username)
+        symbol = FYERS_SYMBOLS[instrument]
+        raw_candles = _fetch_fyers_1min_candles(model, symbol, from_date, to_date)
+    elif broker == "angelone":
+        adapter = _get_angelone_adapter(username)
+        raw_candles = _fetch_angelone_1min_candles(adapter, instrument, from_date, to_date)
+    else:
+        raise SystemExit(f"Unsupported broker '{broker}'. Use fyers or angelone.")
+
     if not raw_candles:
         logger.error("[BACKTEST_ABORTED] No candle data returned — check date range and market hours.")
         return
-    logger.info("[BACKTEST_DATA_FETCHED] %d 1-minute candles for %s", len(raw_candles), symbol)
+    logger.info("[BACKTEST_DATA_FETCHED] %d 1-minute candles for %s", len(raw_candles), instrument)
 
     ltf_candles = resample_candles(raw_candles, instrument, target_minutes=3)
     htf_candles = resample_candles(raw_candles, instrument, target_minutes=75)
@@ -157,7 +225,7 @@ def run(broker: str, instrument: str, username: str | None, from_date: date, to_
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--broker", default="fyers", choices=["fyers"])
+    parser.add_argument("--broker", default="fyers", choices=["fyers", "angelone"])
     parser.add_argument("--instrument", required=True, choices=["NIFTY", "BANKNIFTY"])
     parser.add_argument("--username", default=None, help="Load credentials from the web UI vault")
     parser.add_argument("--from", dest="from_date", default=None, help="YYYY-MM-DD")
