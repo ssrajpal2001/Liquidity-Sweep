@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+secrets/*.json
+secrets/token_store.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Logs / local data
+logs/
+*.log
+data/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+state/
