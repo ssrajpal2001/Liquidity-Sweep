@@ -30,6 +30,13 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
+
+# Make this runnable both as `python3 scripts/test_angelone_feed.py` and as
+# `python3 -m scripts.test_angelone_feed` — the former doesn't add the
+# project root to sys.path (only scripts/ itself), so imports like
+# `webapp.credential_vault` fail unless we add it here explicitly.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from webapp.credential_vault import CredentialVault
 from webapp.secrets_bootstrap import get_or_create_encryption_key
