@@ -61,6 +61,14 @@ class FyersBrokerAdapter(BrokerAdapter):
     def broker_name(self) -> str:
         return "fyers"
 
+    @classmethod
+    def required_credential_fields(cls) -> list[tuple[str, str, bool]]:
+        return [
+            ("client_id", "Client ID (include the -100 suffix, e.g. XC1234-100)", False),
+            ("secret_key", "Secret Key", True),
+            ("redirect_uri", "Redirect URI (must exactly match your Fyers app)", False),
+        ]
+
     # -- auth --------------------------------------------------------------
     def build_login_url(self, state: Optional[str] = None) -> str:
         return self.auth.build_login_url(state)

@@ -82,7 +82,62 @@ by Fyers:
   between `settings.yaml` and `.env` stops the bot rather than guessing
   which one you meant.
 
-## 4. Verify connectivity and run
+## 4. Web UI — login, broker credentials, connect toggle
+
+```bash
+# One-time setup:
+python -c "import secrets; print(secrets.token_hex(32))"
+# -> paste into .env as WEBAPP_SECRET_KEY
+
+python -c "from webapp.credential_vault import generate_encryption_key; print(generate_encryption_key())"
+# -> paste into .env as WEBAPP_ENCRYPTION_KEY (back this up separately — losing it
+#    makes every stored broker credential permanently unreadable)
+
+python -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('your-password-here'))"
+# -> paste into .env as WEBAPP_ADMIN_PASSWORD_HASH
+# also set WEBAPP_ADMIN_USER in .env to whatever username you want
+
+# Run it:
+python run_webapp.py
+```
+
+This prints a URL (`http://<ec2-public-ip>:5000/login`) — open it in a
+browser. Log in, pick a broker from the list, enter that broker's
+credentials (client_id/secret_key/redirect_uri for Fyers — the form
+fields are broker-specific, defined once per adapter), and hit
+**Connect**. That runs the real broker login in your browser and comes
+back here with a live-verified connection.
+
+**Credentials never touch `.env`** — they're stored encrypted in
+`secrets/credentials.db` (Fernet, key from `WEBAPP_ENCRYPTION_KEY`).
+
+### HTTPS note — read this before trying to connect a broker
+
+Fyers' redirect URI (and most brokers') generally needs to be `https://`,
+and the Flask dev server here only speaks plain `http://`. Two ways to
+handle this on EC2:
+- Put a reverse proxy (nginx/Caddy) with a real TLS cert in front of port
+  5000, and register `https://your-domain/brokers/fyers/callback` as the
+  redirect URI on your Fyers app, **exactly** matching what you enter in
+  the credentials form.
+- Or use a tunnel (e.g. `ngrok http 5000`) during testing to get a
+  temporary `https://` URL, and register that as the redirect URI instead.
+
+Either way, the `redirect_uri` field you enter in the web form MUST
+exactly match what's registered on the broker's app dashboard —
+character for character, including trailing slash.
+
+### Scope note
+
+This delivers login, credential management, and a real OAuth
+connect/disconnect toggle with a live connectivity check ("Connected" =
+confirmed reachable right now, polled every 10s). It does **not** yet
+start the tick/strategy/order pipeline (`main.py`'s `TradingSession`)
+from a toggle — that wiring (one running session per connected
+client+broker) is the natural next step, not something folded in here
+without equal care.
+
+## 5. Verify connectivity and run the trading loop directly (bypassing the web UI)
 
 ```bash
 python main.py
@@ -106,7 +161,7 @@ Every meaningful stage logs a distinct `[TAG]` to `logs/bot.log`:
 `grep '\[TAG\]' logs/bot.log` to trace any one stage end to end, or paste
 the whole file back for review.
 
-## 5. Known gaps to watch for
+## 6. Known gaps to watch for
 
 - **Delta may not be available from Fyers' option chain API.** Multiple
   community threads (2024-2026) ask whether Fyers' `optionchain()` reliably
@@ -128,7 +183,7 @@ the whole file back for review.
   backfill on WS reconnect isn't implemented yet, so a candle spanning a
   disconnect may be based on partial data.
 
-## 6. Run tests
+## 7. Run tests
 
 ```bash
 pytest tests/ -v
@@ -141,27 +196,32 @@ against the original worked example, daily guard trip conditions, and a
 full position-lifecycle integration test (entry → fill → Target1 →
 breakeven → trailing stop → exit).
 
-## 7. Repo layout
+## 8. Repo layout
 
 ```
 config/          settings.yaml + config_loader.py + logging_setup.py    (done)
 auth/            auth.py — Fyers OAuth login/token lifecycle            (done)
+brokers/         base.py (BrokerAdapter interface), fyers_adapter.py,
+                 registry.py — the plug-and-play broker layer            (done)
+webapp/          app.py, credential_vault.py, templates/ — login,
+                 per-broker credential form, OAuth connect toggle        (done, trading loop not yet wired to it)
 data_feed/       fyers_rest_client.py, fyers_ws_client.py,
                  candle_aggregator.py                                    (done, tick shape unverified live)
 strategy/        rolling_base.py, state_store.py, sweep_detector.py,
                  displacement.py, retest_trigger.py, filters.py,
                  state_machine.py                                        (done, unit-tested, broker-agnostic)
 execution/       expiry_resolver.py, option_selector.py, risk_engine.py,
-                 order_manager.py, position_manager.py                   (done, delta availability unverified live)
+                 order_manager.py, position_manager.py, greeks_engine.py (done — Delta computed locally, broker-independent)
 risk_controls/   daily_guard.py                                         (done, unit-tested)
 backtest/        replay_engine.py                                       (done — replays real strategy code)
 monitoring/      dashboard.py                                           (Phase 5.5 — not yet built)
 state/           local-only strategy state (rolling base, void flags), gitignored
-secrets/         local-only token storage, gitignored
-tests/           36 unit + integration tests
+secrets/         local-only token storage + credentials.db, gitignored
+tests/           74 unit + integration tests
+run_webapp.py    entrypoint for the web UI
 ```
 
-## 8. Not investment advice
+## 9. Not investment advice
 
 This is a technical build project. Sweep-based option buying carries fast,
 full-premium loss risk; strategy quality only shows up after real

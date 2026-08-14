@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>liquidity-sweep-bot — Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 700px; margin: 40px auto; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th, td { text-align: left; padding: 10px; border-bottom: 1px solid #ddd; }
+    .badge { padding: 3px 10px; border-radius: 10px; font-size: 0.85em; }
+    .connected { background: #d4edda; color: #155724; }
+    .not-connected { background: #f0f0f0; color: #666; }
+    .no-creds { background: #fff3cd; color: #856404; }
+    a.btn { padding: 6px 12px; border: 1px solid #ccc; border-radius: 4px; text-decoration: none; color: #222; margin-right: 6px; }
+    a.btn.primary { background: #0d6efd; color: white; border-color: #0d6efd; }
+    a.btn.danger { background: #dc3545; color: white; border-color: #dc3545; }
+    #status-line { font-size: 0.9em; color: #555; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h2>Brokers</h2>
+  <p>Logged in as <strong>{{ session.get('user_id') if session else '' }}</strong> — <a href="{{ url_for('logout') }}">Log out</a></p>
+
+  <table>
+    <tr><th>Broker</th><th>Credentials</th><th>Status</th><th>Actions</th></tr>
+    {% for name in brokers %}
+    <tr>
+      <td>{{ name }}</td>
+      <td>
+        {% if status[name].has_credentials %}Saved{% else %}Not set{% endif %}
+      </td>
+      <td>
+        {% if status[name].connected %}
+          <span class="badge connected">Connected</span>
+        {% elif status[name].has_credentials %}
+          <span class="badge not-connected">Not connected</span>
+        {% else %}
+          <span class="badge no-creds">Needs credentials</span>
+        {% endif %}
+        <div id="status-{{ name }}" class="status-line"></div>
+      </td>
+      <td>
+        <a class="btn" href="{{ url_for('broker_credentials', broker_name=name) }}">
+          {% if status[name].has_credentials %}Edit{% else %}Add{% endif %} credentials
+        </a>
+        {% if status[name].has_credentials %}
+          {% if status[name].connected %}
+            <a class="btn danger" href="{{ url_for('broker_disconnect', broker_name=name) }}">Disconnect</a>
+          {% else %}
+            <a class="btn primary" href="{{ url_for('broker_connect', broker_name=name) }}">Connect</a>
+          {% endif %}
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <p style="margin-top:30px; font-size:0.85em; color:#888;">
+    "Connect" runs the real broker login (OAuth) in your browser and comes back here.
+    Connection status here reflects a live check, not a cached guess.
+  </p>
+
+  <script>
+    // Poll each connected broker's live status every 10s so "Connected" reflects reality, not a stale flag.
+    {% for name in brokers %}
+    {% if status[name].connected %}
+    setInterval(function() {
+      fetch("/brokers/{{ name }}/status").then(r => r.json()).then(data => {
+        document.getElementById("status-{{ name }}").innerText =
+          data.connected ? ("live: " + (data.user_name || "ok")) : ("live check failed: " + data.detail);
+      });
+    }, 10000);
+    {% endif %}
+    {% endfor %}
+  </script>
+</body>
+</html>

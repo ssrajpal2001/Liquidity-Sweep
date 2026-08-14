@@ -2,6 +2,8 @@
 .env
 secrets/*.json
 secrets/token_store.json
+secrets/*.db
+secrets/tokens/
 
 # Python
 __pycache__/

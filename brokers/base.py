@@ -72,6 +72,14 @@ class BrokerAdapter(ABC):
         """Short machine-readable id, e.g. 'fyers', 'upstox' — used as the
         registry key and in logs/credential storage."""
 
+    @classmethod
+    @abstractmethod
+    def required_credential_fields(cls) -> list[tuple[str, str, bool]]:
+        """(field_name, display_label, is_secret) for every credential
+        this broker needs. Drives the web UI's dynamic credential form —
+        adding a broker never requires touching the UI code, just
+        returning the right fields here."""
+
     # -- auth --------------------------------------------------------------
     @abstractmethod
     def build_login_url(self, state: Optional[str] = None) -> str:
