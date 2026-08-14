@@ -50,15 +50,32 @@ class Candle:
 CandleCallback = Callable[[Candle], None]
 
 
+SESSION_START_MINUTES = 9 * 60 + 15  # 09:15 IST — NSE/BSE market open
+
+
 def _bucket_start(ts: datetime, minutes: int) -> datetime:
-    """Floors a timestamp to the start of its N-minute bucket, anchored to
-    midnight IST (i.e. buckets are 00:00, 00:0N, 00:2N, ... not anchored to
-    market open) — this matches how exchange-provided N-minute candles are
-    conventionally bucketed."""
+    """Floors a timestamp to the start of its N-minute bucket, anchored
+    to market open (09:15 IST), not midnight.
+
+    This matters specifically for 75-minute HTF candles: 09:15 is NOT a
+    multiple of 75 minutes since midnight (555 minutes), so a naive
+    midnight-anchored bucketing produces 08:45-10:00, 10:00-11:15, ...
+    instead of the conventional 09:15-10:30, 10:30-11:45, ... bars every
+    trading platform actually shows. This was caught while building the
+    backtest (a 75-candle window landed in 2 buckets instead of 1) and
+    matters for live trading too, since strategy/rolling_base.py's HTF
+    levels are computed from these same candles.
+
+    Anchoring to session open is mathematically a no-op for 3/5/15-minute
+    buckets — 555 (minutes since midnight at 09:15) divides evenly by
+    3, 5, and 15, so those timeframes bucket identically either way. Only
+    75-minute (and any other non-divisor of 555) actually changes.
+    """
     ts = ts.astimezone(IST)
     minutes_since_midnight = ts.hour * 60 + ts.minute
-    bucket_index = minutes_since_midnight // minutes
-    bucket_start_minutes = bucket_index * minutes
+    offset = minutes_since_midnight - SESSION_START_MINUTES
+    bucket_index = offset // minutes
+    bucket_start_minutes = SESSION_START_MINUTES + bucket_index * minutes
     return ts.replace(
         hour=bucket_start_minutes // 60,
         minute=bucket_start_minutes % 60,

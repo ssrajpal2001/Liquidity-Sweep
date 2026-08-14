@@ -57,6 +57,10 @@ def replay(
     if state_path == ":memory:":
         tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
         tmp.close()
+        Path(tmp.name).unlink()  # NamedTemporaryFile creates an empty file on disk;
+        # StateStore then sees a 0-byte file (not "missing") and logs a noisy but
+        # harmless JSONDecodeError trying to parse it. Deleting it here lets
+        # StateStore take its clean "file doesn't exist yet" path instead.
         store = StateStore(Path(tmp.name))
     else:
         store = StateStore(Path(state_path))

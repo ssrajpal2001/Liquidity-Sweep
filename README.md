@@ -166,7 +166,43 @@ from a toggle — that wiring (one running session per connected
 client+broker) is the natural next step, not something folded in here
 without equal care.
 
-## 5. Verify connectivity and run the trading loop directly (bypassing the web UI)
+## 5. Backtesting — real historical data, real strategy code
+
+```bash
+# NIFTY: last 7 days (weekly expiry -> one cycle)
+python -m backtest.run_backtest --broker fyers --instrument NIFTY
+
+# BANKNIFTY: full current month so far (monthly expiry -> one cycle)
+python -m backtest.run_backtest --broker fyers --instrument BANKNIFTY
+
+# Or an explicit range for either:
+python -m backtest.run_backtest --broker fyers --instrument NIFTY --from 2026-08-01 --to 2026-08-14
+
+# Using web-UI-saved credentials instead of .env:
+python -m backtest.run_backtest --broker fyers --username ssrajpal2001 --instrument NIFTY
+```
+
+Fetches real 1-minute historical candles from Fyers, resamples them to
+the configured LTF (3m) and HTF (75m) timeframes
+(`backtest/candle_resampler.py`), and runs them through the exact same
+strategy code (`strategy/state_machine.py`) that runs live — not a
+second, separately-maintained copy of the rules.
+
+**What this tells you:** how many valid signals the ruleset would have
+fired, in which direction, and when. **What it doesn't tell you:** P&L —
+option premium isn't simulated, only spot-level signal detection. A
+premium-aware fill simulator is a reasonable next addition.
+
+**A real bug this surfaced and fixed:** 75-minute HTF candles were
+bucketing to midnight-anchored boundaries (08:45-10:00, 10:00-11:15...)
+instead of market-open-anchored ones (09:15-10:30, 10:30-11:45...) — this
+affected live trading too, not just backtesting, since
+`strategy/rolling_base.py`'s HTF levels come from these same candles.
+Fixed in `data_feed/candle_aggregator.py`; verified the fix doesn't
+change 3/5/15-minute bucketing at all (mathematically guaranteed, since
+09:15 divides evenly into those).
+
+## 6. Verify connectivity and run the trading loop directly (bypassing the web UI)
 
 ```bash
 python main.py
@@ -190,7 +226,7 @@ Every meaningful stage logs a distinct `[TAG]` to `logs/bot.log`:
 `grep '\[TAG\]' logs/bot.log` to trace any one stage end to end, or paste
 the whole file back for review.
 
-## 6. Known gaps to watch for
+## 7. Known gaps to watch for
 
 - **Delta may not be available from Fyers' option chain API.** Not a problem anymore —
   `execution/greeks_engine.py` computes Delta locally (Black-Scholes from the
@@ -217,7 +253,7 @@ the whole file back for review.
 - **REST resync on reconnect** logs a placeholder — historical-candle
   backfill on WS reconnect isn't implemented yet.
 
-## 7. Run tests
+## 8. Run tests
 
 ```bash
 pytest tests/ -v
@@ -230,7 +266,7 @@ against the original worked example, daily guard trip conditions, and a
 full position-lifecycle integration test (entry → fill → Target1 →
 breakeven → trailing stop → exit).
 
-## 8. Repo layout
+## 9. Repo layout
 
 ```
 config/          settings.yaml + config_loader.py + logging_setup.py    (done)
@@ -247,7 +283,7 @@ strategy/        rolling_base.py, state_store.py, sweep_detector.py,
 execution/       expiry_resolver.py, option_selector.py, risk_engine.py,
                  order_manager.py, position_manager.py, greeks_engine.py (done — Delta computed locally, broker-independent)
 risk_controls/   daily_guard.py                                         (done, unit-tested)
-backtest/        replay_engine.py                                       (done — replays real strategy code)
+backtest/        replay_engine.py, candle_resampler.py, run_backtest.py    (done — replays real strategy code against real historical data)
 monitoring/      dashboard.py                                           (Phase 5.5 — not yet built)
 state/           local-only strategy state (rolling base, void flags), gitignored
 secrets/         local-only token storage + credentials.db, gitignored
@@ -255,7 +291,7 @@ tests/           74 unit + integration tests
 run_webapp.py    entrypoint for the web UI
 ```
 
-## 9. Not investment advice
+## 10. Not investment advice
 
 This is a technical build project. Sweep-based option buying carries fast,
 full-premium loss risk; strategy quality only shows up after real

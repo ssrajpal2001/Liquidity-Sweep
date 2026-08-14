@@ -48,6 +48,7 @@ OPTION_INSTRUMENT_TYPES = ("OPTIDX", "OPTSTK")
 # account — e.g. via searchScrip — before trusting these for real orders.
 KNOWN_INDEX_SPOT_TOKENS: dict[tuple[str, str], str] = {
     ("NIFTY", "NSE"): "99926000",
+    ("BANKNIFTY", "NSE"): "99926009",
     ("SENSEX", "BSE"): "99919000",
 }
 
