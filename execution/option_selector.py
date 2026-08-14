@@ -4,18 +4,14 @@ execution/option_selector.py
 Selects the option contract to trade via Fyers' optionchain() API, with
 1-3 min caching (Edge Case 4 from the review) exactly as before.
 
-IMPORTANT CAVEAT, found during research for this integration: multiple
-Fyers community threads (spanning 2024-2026) ask whether the option chain
-API reliably returns Greeks/Delta at all — this is NOT settled the way
-Upstox's typed SDK response was. So this module tries the documented
-`greeks=1` path first, but if no strike in the response actually carries
-a usable delta field, it falls back to selecting by STRIKE DISTANCE from
-spot (nearest ATM, or N strikes ITM) rather than crashing or silently
-picking a wrong contract. Which path was used is logged explicitly —
-please check for `[DELTA_UNAVAILABLE_FALLBACK]` in tomorrow's log; if it
-fires, the "Delta ≈ 0.50-0.60" selection logic is running in degraded
-mode and the risk math (Spot Risk x Delta = Premium SL) will use an
-assumed delta rather than a live one.
+DELTA FIX: this used to fall back to a hardcoded ASSUMED_ATM_DELTA
+constant when a broker's response had no delta field, which is a weak
+guess. It now falls back to execution/greeks_engine.py's broker-
+independent Black-Scholes calculation instead — computed from the
+option's own live LTP, spot, strike, and time-to-expiry, so it never
+depends on whether Fyers (or any future broker) happens to supply
+Greeks. Whether a leg's delta came from the broker or was computed is
+tracked on SelectedOption.delta_is_estimated and logged either way.
 """
 from __future__ import annotations
 
@@ -24,9 +20,9 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from execution.greeks_engine import compute_delta_from_price
 
-ASSUMED_ATM_DELTA = 0.50  # used only in the fallback path, see module docstring
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -95,53 +91,67 @@ class OptionSelector:
         chain = (response.get("data") or {}).get("optionsChain") or []
         return [row for row in chain if row.get("option_type") in ("CE", "PE")]
 
-    def _pick_by_delta(self, chain: list[dict], option_type: str, spot: float) -> Optional[SelectedOption]:
+    def _pick_by_delta(self, chain: list[dict], option_type: str, spot: float, expiry: str) -> Optional[SelectedOption]:
         candidates = [row for row in chain if row.get("option_type") == option_type]
         if not candidates:
             return None
 
-        # Path 1: real delta from the response, if present.
-        with_delta = [c for c in candidates if c.get("delta") not in (None, "", 0)]
-        if with_delta:
-            best, best_distance = None, float("inf")
-            midpoint = (self.target_delta_min + self.target_delta_max) / 2
-            for row in with_delta:
-                try:
-                    abs_delta = abs(float(row["delta"]))
-                except (TypeError, ValueError):
-                    continue
-                if self.target_delta_min <= abs_delta <= self.target_delta_max:
-                    distance = abs(abs_delta - midpoint)
-                    if distance < best_distance:
-                        best_distance = distance
-                        best = SelectedOption(
-                            symbol=row["symbol"], strike_price=float(row["strike_price"]),
-                            option_type=option_type, ltp=float(row.get("ltp", 0)),
-                            delta=abs_delta, delta_is_estimated=False, fetched_at=time.time(),
-                        )
-            if best is not None:
-                return best
-            logger.warning(
-                "%s: response had delta values but none in [%.2f, %.2f] — "
-                "falling back to strike-distance selection.",
-                option_type, self.target_delta_min, self.target_delta_max,
-            )
+        # Compute (or read) a delta for every candidate strike, then pick
+        # whichever lands closest to the target range midpoint — same
+        # selection logic regardless of where the delta came from.
+        scored: list[SelectedOption] = []
+        for row in candidates:
+            try:
+                strike = float(row["strike_price"])
+                ltp = float(row.get("ltp", 0))
+                symbol = row["symbol"]
+            except (KeyError, TypeError, ValueError):
+                continue
 
-        # Path 2: fallback — no usable delta anywhere in the response.
-        logger.warning(
-            "[DELTA_UNAVAILABLE_FALLBACK] %s: no delta field in option chain response "
-            "for %s — selecting by strike distance from spot instead (assumed delta=%.2f).",
-            option_type, self.underlying_symbol, ASSUMED_ATM_DELTA,
-        )
-        candidates_sorted = sorted(candidates, key=lambda r: abs(float(r["strike_price"]) - spot))
-        if not candidates_sorted:
+            raw_delta = row.get("delta")
+            if raw_delta not in (None, "", 0):
+                try:
+                    delta = abs(float(raw_delta))
+                    estimated = False
+                except (TypeError, ValueError):
+                    delta, estimated = self._estimate_delta(ltp, spot, strike, expiry, option_type)
+            else:
+                delta, estimated = self._estimate_delta(ltp, spot, strike, expiry, option_type)
+
+            scored.append(SelectedOption(
+                symbol=symbol, strike_price=strike, option_type=option_type,
+                ltp=ltp, delta=delta, delta_is_estimated=estimated, fetched_at=time.time(),
+            ))
+
+        in_range = [s for s in scored if self.target_delta_min <= s.delta <= self.target_delta_max]
+        if not in_range:
+            logger.warning(
+                "%s: no strike landed in delta range [%.2f, %.2f] (checked %d strikes, "
+                "%d with broker-supplied delta) — widening search may be needed.",
+                option_type, self.target_delta_min, self.target_delta_max,
+                len(scored), sum(1 for s in scored if not s.delta_is_estimated),
+            )
             return None
-        row = candidates_sorted[0]  # nearest-to-spot strike, i.e. ATM
-        return SelectedOption(
-            symbol=row["symbol"], strike_price=float(row["strike_price"]),
-            option_type=option_type, ltp=float(row.get("ltp", 0)),
-            delta=ASSUMED_ATM_DELTA, delta_is_estimated=True, fetched_at=time.time(),
-        )
+
+        midpoint = (self.target_delta_min + self.target_delta_max) / 2
+        best = min(in_range, key=lambda s: abs(s.delta - midpoint))
+        if best.delta_is_estimated:
+            logger.info(
+                "[DELTA_COMPUTED_LOCALLY] %s %s strike=%.0f delta=%.3f (Black-Scholes from live LTP, "
+                "not broker-supplied)", option_type, best.symbol, best.strike_price, best.delta,
+            )
+        return best
+
+    @staticmethod
+    def _estimate_delta(
+        ltp: float, spot: float, strike: float, expiry: str, option_type: str
+    ) -> tuple[float, bool]:
+        try:
+            expiry_epoch = float(expiry) if expiry else None
+        except (TypeError, ValueError):
+            expiry_epoch = None
+        delta = compute_delta_from_price(ltp, spot, strike, expiry_epoch, option_type)
+        return delta, True
 
     def select(self, expiry: str, current_spot: float, option_type: str) -> Optional[SelectedOption]:
         if self._cache_is_stale(current_spot):
@@ -149,7 +159,7 @@ class OptionSelector:
             if not chain:
                 return self._cache.get(option_type)  # fall back to stale cache over nothing
             for ot in ("CE", "PE"):
-                selected = self._pick_by_delta(chain, ot, current_spot)
+                selected = self._pick_by_delta(chain, ot, current_spot, expiry)
                 if selected is not None:
                     self._cache[ot] = selected
             self._cache_spot_price = current_spot
