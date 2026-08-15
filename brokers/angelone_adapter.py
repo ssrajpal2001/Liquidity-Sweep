@@ -193,21 +193,27 @@ class AngelOneBrokerAdapter(BrokerAdapter):
         return self._get_smart() is not None
 
     def test_connection(self) -> ConnectionCheckResult:
+        """Reports connection state — does NOT silently re-authenticate as
+        a side effect. A previous version called self.login() here as a
+        fallback on any failure, which is a real anti-pattern: this method
+        gets called by the dashboard's status polling, and a routine
+        health check should never have the side effect of performing a
+        full fresh TOTP login against AngelOne's real servers. If the
+        session genuinely needs refreshing, that's what the Connect
+        button is for — a deliberate action, not an automatic one."""
         smart = self._get_smart()
         if smart is None:
-            # AngelOne's genuine advantage: no browser needed, so a stale/
-            # missing session can just re-login right here rather than
-            # forcing the caller through a UI round trip.
-            return self.login()
+            return ConnectionCheckResult(ok=False, detail="No stored session — click Connect to log in.")
         try:
             session = self.session_store.load()
             profile = smart.getProfile(session.refresh_token if session else "")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("AngelOne connectivity check failed, retrying via fresh login: %s", exc)
-            return self.login()
+            logger.warning("AngelOne connectivity check failed: %s", exc)
+            return ConnectionCheckResult(ok=False, detail=f"Connectivity check failed: {exc}")
 
         if not profile or not profile.get("status"):
-            return self.login()  # stale session — headless re-login, no human needed
+            detail = profile.get("message", "Unknown error") if profile else "No response"
+            return ConnectionCheckResult(ok=False, detail=f"Session appears invalid: {detail}")
 
         data = profile.get("data", {})
         return ConnectionCheckResult(

@@ -325,3 +325,32 @@ def test_logs_tail_returns_actual_log_content(client, tmp_path):
         r = client.get("/logs/tail")
     data = r.get_json()
     assert data["lines"] == ["line1", "line2", "line3"]
+
+
+def test_status_route_throttles_repeated_polls_to_avoid_hammering_the_broker(client):
+    """Regression test for a real bug found live: the dashboard polls
+    /brokers/<name>/status every 8s, and each call used to hit the real
+    broker's connectivity check (and for AngelOne, could cascade into a
+    full re-login). 5 rapid polls must collapse into 1 real broker call."""
+    import pyotp
+    from unittest.mock import patch
+
+    _register(client)
+    totp_secret = pyotp.random_base32()
+    client.post("/brokers/angelone/credentials", data={
+        "api_key": "test_key", "client_code": "A123456", "pin": "1234", "totp_secret": totp_secret,
+    })
+
+    call_count = {"n": 0}
+
+    def fake_test_connection(self):
+        call_count["n"] += 1
+        from brokers.base import ConnectionCheckResult
+        return ConnectionCheckResult(ok=True, detail="ok", user_name="Test", user_id="A123456")
+
+    with patch("brokers.angelone_adapter.AngelOneBrokerAdapter.test_connection", fake_test_connection), \
+         patch("brokers.angelone_adapter.AngelOneBrokerAdapter.is_authenticated", return_value=True):
+        for _ in range(5):
+            client.get("/brokers/angelone/status")
+
+    assert call_count["n"] == 1

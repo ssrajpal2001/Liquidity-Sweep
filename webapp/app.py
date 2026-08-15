@@ -237,17 +237,38 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     # -- live status check (what "see what's happening" shows today) -----------
+    # Throttled: adapter.test_connection() is a REAL network call to the
+    # broker (and for AngelOne specifically, can fall back to a full fresh
+    # TOTP login if that call errors — a real bug found live: the dashboard
+    # polls this route every 8s, which was silently re-authenticating
+    # against AngelOne's servers every single poll). No broker's real
+    # connectivity check should run that often regardless of UI poll
+    # frequency, so results are cached here for STATUS_CACHE_SECONDS and
+    # only refreshed when actually stale.
+    STATUS_CACHE_SECONDS = 45
+    _status_cache: dict[tuple[str, str], tuple[float, dict]] = {}
+
     @app.route("/brokers/<broker_name>/status")
     @login_required
     def broker_status(broker_name: str):
+        import time as _time
+
+        cache_key = (session["user_id"], broker_name)
+        cached = _status_cache.get(cache_key)
+        if cached is not None and _time.time() - cached[0] < STATUS_CACHE_SECONDS:
+            return jsonify(cached[1])
+
         adapter = _adapter_for(session["user_id"], broker_name, vault)
         if adapter is None or not adapter.is_authenticated():
-            return jsonify({"connected": False, "detail": "Not connected."})
-        check = adapter.test_connection()
-        return jsonify({
-            "connected": check.ok, "detail": check.detail,
-            "user_name": check.user_name, "user_id": check.user_id,
-        })
+            result = {"connected": False, "detail": "Not connected."}
+        else:
+            check = adapter.test_connection()
+            result = {
+                "connected": check.ok, "detail": check.detail,
+                "user_name": check.user_name, "user_id": check.user_id,
+            }
+        _status_cache[cache_key] = (_time.time(), result)
+        return jsonify(result)
 
     # -- trading engine control (merged into this process) ---------------------
     @app.route("/brokers/<broker_name>/start_trading", methods=["POST"])
