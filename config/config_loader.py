@@ -23,7 +23,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 
-REQUIRED_ENV_VARS = ["FYERS_CLIENT_ID", "FYERS_SECRET_KEY", "FYERS_REDIRECT_URI"]
+REQUIRED_ENV_VARS: list[str] = []  # nothing is unconditionally required — see FYERS_ENV_VARS below
+FYERS_ENV_VARS = ["FYERS_CLIENT_ID", "FYERS_SECRET_KEY", "FYERS_REDIRECT_URI"]
 REQUIRED_YAML_SECTIONS = [
     "app", "capital", "instruments", "timeframes",
     "session", "option_selection", "execution", "risk",
@@ -37,10 +38,21 @@ class ConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class EnvConfig:
-    """Secrets and environment-level settings, sourced from .env."""
-    client_id: str
-    secret_key: str
-    redirect_uri: str
+    """Secrets and environment-level settings, sourced from .env.
+
+    client_id/secret_key/redirect_uri are Fyers-specific and OPTIONAL
+    here — they're only required by the direct `python main.py`-via-.env
+    path (see main.py's _get_broker_adapter(), which checks for them
+    explicitly with a clear error). The multi-broker web UI / session
+    manager path gets broker credentials from the encrypted vault per
+    client instead and never needs these three at all — requiring them
+    unconditionally here was a real bug: starting an AngelOne session
+    failed with a Fyers-credentials error that had nothing to do with
+    AngelOne.
+    """
+    client_id: Optional[str]
+    secret_key: Optional[str]
+    redirect_uri: Optional[str]
     paper_mode: bool
     auth_code: Optional[str]
     token_store_path: Path
@@ -121,9 +133,9 @@ def _load_env(env_path: Path) -> EnvConfig:
         token_store_path = PROJECT_ROOT / token_store_path
 
     return EnvConfig(
-        client_id=os.environ["FYERS_CLIENT_ID"],
-        secret_key=os.environ["FYERS_SECRET_KEY"],
-        redirect_uri=os.environ["FYERS_REDIRECT_URI"],
+        client_id=os.getenv("FYERS_CLIENT_ID") or None,
+        secret_key=os.getenv("FYERS_SECRET_KEY") or None,
+        redirect_uri=os.getenv("FYERS_REDIRECT_URI") or None,
         paper_mode=paper_mode_val,
         auth_code=os.getenv("FYERS_AUTH_CODE") or None,
         token_store_path=token_store_path,

@@ -307,9 +307,17 @@ def _get_broker_adapter(settings: Settings) -> BrokerAdapter:
     """Fyers-via-.env only, for now — the direct main.py-style path.
     Running against AngelOne (or any web-UI-connected broker) needs a
     per-client BrokerAdapter built from vault credentials instead — that
-    plumbing lives in backtest/run_backtest.py's _get_adapter() and is
-    the natural template for a future multi-client session manager, not
-    duplicated here."""
+    plumbing lives in webapp/broker_session_builder.py and is what
+    orchestration/session_manager.py uses, not duplicated here."""
+    if not (settings.env.client_id and settings.env.secret_key and settings.env.redirect_uri):
+        raise RuntimeError(
+            "This direct-run path (python main.py) requires FYERS_CLIENT_ID, "
+            "FYERS_SECRET_KEY, and FYERS_REDIRECT_URI in .env — they're not "
+            "required globally anymore (config_loader.py), only here, since "
+            "the web UI / session manager path gets broker credentials from "
+            "the vault instead. Either fill these into .env, or use "
+            "`python run_webapp.py` / `python -m orchestration.session_manager` instead."
+        )
     auth = FyersAuth(settings.env)
     if not auth.is_authenticated():
         raise RuntimeError("Not authenticated. Run: python -m auth.auth login")

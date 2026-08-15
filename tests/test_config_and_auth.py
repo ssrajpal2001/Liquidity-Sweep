@@ -83,16 +83,42 @@ def test_load_settings_success(project_files, monkeypatch):
     assert settings.instrument("NIFTY")["spot_key"] == "NSE:NIFTY50-INDEX"
 
 
-def test_load_settings_missing_env_var_raises(tmp_path, monkeypatch):
+def test_load_settings_succeeds_with_no_fyers_env_vars_at_all(tmp_path, monkeypatch):
+    """Regression test for a real bug: load_settings() used to require
+    FYERS_CLIENT_ID/SECRET/REDIRECT_URI unconditionally, which broke
+    starting an AngelOne (or any non-Fyers) session through the web UI /
+    session manager with a completely unrelated 'missing Fyers
+    credentials' error. These three are now optional at this layer —
+    only main.py's direct Fyers-via-.env path requires them, and it
+    checks for them itself with a clear, specific error."""
     settings_path = tmp_path / "settings.yaml"
     settings_path.write_text(MINIMAL_YAML, encoding="utf-8")
     env_path = tmp_path / ".env"
-    env_path.write_text("FYERS_CLIENT_ID=only_this_one\n", encoding="utf-8")
+    env_path.write_text("PAPER_MODE=true\n", encoding="utf-8")  # no Fyers vars at all
 
     _clear_fyers_env(monkeypatch)
 
-    with pytest.raises(ConfigError, match="Missing required environment variable"):
-        load_settings(settings_path=settings_path, env_path=env_path)
+    settings = load_settings(settings_path=settings_path, env_path=env_path)
+    assert settings.env.client_id is None
+    assert settings.env.secret_key is None
+    assert settings.env.redirect_uri is None
+
+
+def test_main_get_broker_adapter_raises_clear_error_when_fyers_env_vars_missing(tmp_path, monkeypatch):
+    """The other half of the same fix: main.py's direct Fyers path DOES
+    still need these three, and must fail with a specific, actionable
+    message rather than the generic config_loader one."""
+    import main as main_module
+
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(MINIMAL_YAML, encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("PAPER_MODE=true\n", encoding="utf-8")
+    _clear_fyers_env(monkeypatch)
+
+    settings = load_settings(settings_path=settings_path, env_path=env_path)
+    with pytest.raises(RuntimeError, match="FYERS_CLIENT_ID"):
+        main_module._get_broker_adapter(settings)
 
 
 def test_load_settings_missing_yaml_section_raises(tmp_path, monkeypatch):
