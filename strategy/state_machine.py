@@ -70,12 +70,22 @@ class InstrumentStateMachine:
         sweep_buffer_points: float,
         atr_multiplier: float = 1.5,
         on_event: Optional[Callable[[str, dict], None]] = None,
+        displacement_window_candles: int = 2,
     ):
         self.instrument_key = instrument_key
         self.store = store
         self.session_config = session_config
         self.sweep_buffer_points = sweep_buffer_points
         self.atr_multiplier = atr_multiplier
+        # Real gap fixed here, per external review of the strategy code:
+        # displacement used to be required on the EXACT SAME candle as the
+        # sweep, which misses the very common "wick grabs liquidity on
+        # candle N (tiny body), the actual institutional move happens on
+        # candle N+1 or N+2" pattern. Now a pending sweep survives up to
+        # this many additional candles, checking each one for displacement
+        # against the swing structure at that point, before being
+        # discarded as a genuine false sweep.
+        self.displacement_window_candles = displacement_window_candles
         # Optional diagnostic hook — default no-op, zero effect on live
         # trading behavior. Fires at every pipeline stage (rolling base
         # update, sweep detected/rejected, displacement, FVG, retest
@@ -89,6 +99,8 @@ class InstrumentStateMachine:
 
         self._ltf_history: list[Candle] = []      # recent LTF candles, for ATR + micro-swing
         self._pending_sweep: Optional[SweepEvent] = None
+        self._sweep_candle: Optional[Candle] = None      # the candle that actually swept — SL is measured from THIS, not the displacement candle
+        self._displacement_candles_checked = 0            # how many candles since the sweep we've checked for displacement
 
     # -- void state ------------------------------------------------------------
     def _is_blocked(self) -> bool:
@@ -156,6 +168,14 @@ class InstrumentStateMachine:
             if was_armed_before and not self.retest.is_armed:
                 # check() disarmed it internally (staleness) without triggering.
                 self._on_event("retest_stale", {"candle_open_time": candle.open_time})
+                # Real bug fix: without this, self._pending_sweep (and the
+                # displacement-window counter) would survive past a stale
+                # retest and incorrectly resume being checked as if still
+                # mid-window on the next sweep search, since it was never
+                # cleared on the success path (only on explicit rejection).
+                self._pending_sweep = None
+                self._sweep_candle = None
+                self._displacement_candles_checked = 0
             return None
 
         if self._is_blocked():
@@ -165,36 +185,61 @@ class InstrumentStateMachine:
         if base is None:
             return None
 
-        # 2. Sweep detection against the current (possibly just-updated) base.
-        sweep = detect_sweep(candle, base.high, base.low)
-        if sweep is None:
-            return None
-        logger.info("%s: sweep detected — %s", self.instrument_key, sweep)
-        self._on_event("sweep_detected", {
-            "candle_open_time": candle.open_time, "direction": sweep.direction.value,
-            "level": sweep.level, "pierce_points": sweep.pierce_points,
-        })
-        self._pending_sweep = sweep
+        # 2. Sweep detection — but ONLY start a fresh search if we're not
+        #    already inside a displacement window from a prior candle's
+        #    sweep. This is the fix: displacement no longer has to occur
+        #    on the exact same candle as the sweep — a pending sweep
+        #    survives up to displacement_window_candles additional
+        #    candles, checking each one, before being discarded.
+        if self._pending_sweep is None:
+            sweep = detect_sweep(candle, base.high, base.low)
+            if sweep is None:
+                return None
+            logger.info("%s: sweep detected — %s", self.instrument_key, sweep)
+            self._on_event("sweep_detected", {
+                "candle_open_time": candle.open_time, "direction": sweep.direction.value,
+                "level": sweep.level, "pierce_points": sweep.pierce_points,
+            })
+            self._pending_sweep = sweep
+            self._sweep_candle = candle
+            self._displacement_candles_checked = 0
+            displacement_check_candle = candle
+        else:
+            # Already have a pending sweep from an earlier candle — this
+            # candle is one of the "next 1-2 candles" being checked for
+            # the actual displacement move.
+            self._displacement_candles_checked += 1
+            displacement_check_candle = candle
 
-        # 3. Displacement / MSS confirmation on this same candle (the sweep
-        #    candle itself, if it also displaces — otherwise wait; a fuller
-        #    implementation would check the next 1-2 candles too).
+        # 3. Displacement / MSS confirmation — checked against WHICHEVER
+        #    candle we're currently evaluating (the sweep candle itself on
+        #    the first pass, or a subsequent candle within the window).
         lookback = self._ltf_history[-6:-1]
         recent_swing_high = max((c.high for c in self._ltf_history[-6:-1]), default=candle.high)
         recent_swing_low = min((c.low for c in self._ltf_history[-6:-1]), default=candle.low)
         disp = displacement_mod.detect_displacement(
-            candle, lookback, recent_swing_high, recent_swing_low, self.atr_multiplier
+            displacement_check_candle, lookback, recent_swing_high, recent_swing_low, self.atr_multiplier
         )
         if disp is None:
-            self._on_event("sweep_rejected", {
-                "candle_open_time": candle.open_time, "reason": "no_displacement",
-            })
-            self._pending_sweep = None
+            if self._displacement_candles_checked >= self.displacement_window_candles:
+                self._on_event("sweep_rejected", {
+                    "candle_open_time": candle.open_time, "reason": "no_displacement",
+                    "candles_checked": self._displacement_candles_checked + 1,
+                })
+                self._pending_sweep = None
+                self._sweep_candle = None
+                self._displacement_candles_checked = 0
+            else:
+                self._on_event("displacement_window_extended", {
+                    "candle_open_time": candle.open_time,
+                    "candles_checked": self._displacement_candles_checked + 1,
+                })
             return None
         logger.info("%s: displacement confirmed — %s", self.instrument_key, disp)
         self._on_event("displacement_confirmed", {
             "candle_open_time": candle.open_time, "direction": disp.direction.value,
             "body_to_atr_ratio": disp.body_to_atr_ratio,
+            "candles_after_sweep": self._displacement_candles_checked,
         })
 
         # 4. FVG check needs the candle after the displacement candle, which
@@ -214,6 +259,8 @@ class InstrumentStateMachine:
                     "candle_open_time": candle.open_time, "reason": "no_fvg",
                 })
                 self._pending_sweep = None
+                self._sweep_candle = None
+                self._displacement_candles_checked = 0
         return None
 
     def _finalize_signal(self, entry_candle: Candle) -> Optional[SignalDecision]:

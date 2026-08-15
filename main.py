@@ -122,6 +122,7 @@ class TradingSession:
                 session_config=settings.session,
                 sweep_buffer_points=settings.risk["sweep_buffer_points"].get(inst["name"], 5),
                 atr_multiplier=settings.risk["atr_displacement_multiplier"],
+                displacement_window_candles=settings.risk.get("displacement_window_candles", 2),
             )
             self.option_selectors[key] = GenericOptionSelector(
                 broker,

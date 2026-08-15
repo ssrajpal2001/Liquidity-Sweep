@@ -59,6 +59,7 @@ risk:
     NIFTY: 4
     SENSEX: 10
   atr_displacement_multiplier: 1.5   # displacement candle body must exceed this x ATR
+  displacement_window_candles: 2      # how many candles after a sweep to keep checking for displacement (not just the sweep candle itself — real institutional moves often land 1-2 candles later)
   trail_distance_points: 5.0          # TSL: trails this many premium points behind best price seen, after Target 1
 
 logging:
