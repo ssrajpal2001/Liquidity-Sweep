@@ -149,6 +149,24 @@ class FyersBrokerAdapter(BrokerAdapter):
                 logger.warning("Skipping malformed option chain row: %s", row)
         return legs
 
+    def get_historical_candles(self, symbol: str, from_date, to_date) -> list[tuple]:
+        """Fyers history() response shape confirmed against real usage
+        code: response['candles'] = [[epoch, o, h, l, c, v], ...]."""
+        payload = {
+            "symbol": symbol, "resolution": "1", "date_format": "1",
+            "range_from": from_date.isoformat(), "range_to": to_date.isoformat(),
+            "cont_flag": "1",
+        }
+        try:
+            response = self.rest_client.model.history(data=payload)
+        except Exception:  # noqa: BLE001
+            logger.exception("Fyers history() failed for %s", symbol)
+            return []
+        if not isinstance(response, dict) or response.get("s") != "ok":
+            logger.error("Fyers history() failed for %s: %s", symbol, response)
+            return []
+        return [tuple(row) for row in response.get("candles", [])]
+
     # -- orders --------------------------------------------------------------
     def place_entry_buy(self, symbol: str, quantity: int, current_ask: float, tag: str) -> OrderResult:
         r = self.order_manager.place_entry_buy(symbol, quantity, current_ask, tag)

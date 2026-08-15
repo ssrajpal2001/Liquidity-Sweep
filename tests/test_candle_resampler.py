@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from backtest.candle_resampler import resample_candles
+from data_feed.candle_resampler import resample_candles
 
 
 def _minute_candle(base_epoch: float, minute_offset: int, price: float):

@@ -58,3 +58,28 @@ def test_late_tick_does_not_corrupt_current_candle():
 
     assert agg._current.high == 100.0  # late tick ignored, didn't corrupt current candle
     assert closed == []
+
+
+def test_candle_aggregator_bootstrap_instrument_resyncs_after_gap():
+    """Regression coverage for the WS-reconnect resync path: a gap in live
+    ticks should be repairable by feeding raw historical candles back in,
+    resampled to whatever timeframe each registered aggregator needs —
+    not just 3-min, but 75-min HTF too, from the SAME raw 1-min source."""
+    from data_feed.candle_aggregator import CandleAggregator
+
+    closed = []
+    agg = CandleAggregator(on_close=lambda c: closed.append(c))
+    agg.register("NIFTY", 3)
+    agg.register("NIFTY", 75)
+
+    base = datetime(2026, 8, 14, 3, 45, tzinfo=timezone.utc).timestamp()  # 09:15 IST
+    raw = [(base + i * 60, 25000 + i, 25000 + i + 2, 25000 + i - 2, 25000 + i + 1, 1000) for i in range(10)]
+
+    agg.bootstrap_instrument("NIFTY", raw)
+
+    # 10 one-minute candles at 3-min resolution -> 3 closed candles + 1 in-progress (per bucket rule)
+    three_min_closed = [c for c in closed if c.timeframe_minutes == 3]
+    assert len(three_min_closed) >= 2  # at least 2 fully closed 3-min buckets from 10 minutes of data
+    # Same raw data resampled independently to 75-min HTF too — only 1 bucket, still in progress (not closed yet).
+    seventy_five_min_closed = [c for c in closed if c.timeframe_minutes == 75]
+    assert len(seventy_five_min_closed) == 0  # 10 minutes < 75, so nothing closes, only seeds in-progress

@@ -162,6 +162,18 @@ class BrokerAdapter(ABC):
         per-leg — callers must use execution/greeks_engine.py as a
         fallback rather than assuming it's always populated."""
 
+    @abstractmethod
+    def get_historical_candles(
+        self, symbol: str, from_date, to_date
+    ) -> list[tuple[float, float, float, float, float, float]]:
+        """Returns (epoch_seconds, open, high, low, close, volume) tuples
+        at the broker's finest available resolution (1-minute for both
+        Fyers and AngelOne — neither offers a native 75-minute bar).
+        Callers resample to whatever timeframe they need via
+        data_feed/candle_resampler.py. Used by both backtest/run_backtest.py
+        and main.py's WS-reconnect resync path — one implementation per
+        broker, not duplicated per caller."""
+
     # -- orders --------------------------------------------------------------
     @abstractmethod
     def place_entry_buy(self, symbol: str, quantity: int, current_ask: float, tag: str) -> OrderResult:

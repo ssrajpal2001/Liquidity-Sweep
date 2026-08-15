@@ -166,3 +166,20 @@ class CandleAggregator:
         for (inst_key, _tf), agg in self._aggregators.items():
             if inst_key == instrument_key:
                 agg.ingest(price, ts)
+
+    def bootstrap_instrument(
+        self, instrument_key: str, raw_1min_candles: list[tuple[float, float, float, float, float, float]]
+    ) -> None:
+        """Resamples raw (epoch, o, h, l, c, v) 1-minute candles to every
+        registered timeframe for this instrument and seeds each
+        TimeframeAggregator from them — used on startup and, critically,
+        on WS reconnect: a gap in ticks would otherwise leave whatever
+        candle was in progress silently truncated instead of correctly
+        completed from the missed history."""
+        from data_feed.candle_resampler import resample_candles
+
+        for (inst_key, timeframe_minutes), agg in self._aggregators.items():
+            if inst_key != instrument_key:
+                continue
+            resampled = resample_candles(raw_1min_candles, instrument_key, timeframe_minutes)
+            agg.bootstrap_from_historical(resampled)

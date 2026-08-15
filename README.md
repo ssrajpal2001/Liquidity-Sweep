@@ -212,6 +212,48 @@ change 3/5/15-minute bucketing at all (mathematically guaranteed, since
 python main.py
 ```
 
+**Broker-agnostic** — `main.py`'s `TradingSession` depends only on the
+`BrokerAdapter` interface, never on a concrete broker class. This
+particular entrypoint is still wired to Fyers-via-`.env` for the
+single-client, no-web-UI path; for any broker connected through the web
+UI (Fyers or AngelOne), use section 7 instead.
+
+## 7. Multi-client — run every connected client's broker simultaneously
+
+```bash
+python -m orchestration.session_manager
+```
+
+Scans every registered web UI account, finds every broker each one has
+marked **Connected**, and starts one fully independent trading session
+per (client, broker) pair — own broker connection, own isolated state
+file (`state/{user}__{broker}_strategy_state.json`), own daily loss
+guard. Two clients both trading NIFTY never share state or interfere
+with each other.
+
+Re-scans for newly-connected clients every 5 minutes by default
+(`--poll-seconds` to change it) — connect a new broker via the web UI
+while this is running and it'll pick it up on the next scan without a
+restart.
+
+**Scope, stated plainly:** strategy configuration (instruments, capital,
+risk %, timeframes) currently comes from one shared
+`config/settings.yaml` for every client — true per-client strategy/
+capital configuration is a further step, not built yet. What IS isolated
+per client today: broker connection, rolling-base/void state, and trade
+execution.
+
+## 8. WS-reconnect resync
+
+On a WebSocket disconnect/reconnect, `main.py` and the session manager
+both fetch recent 1-minute historical candles via
+`BrokerAdapter.get_historical_candles()` and feed them through
+`CandleAggregator.bootstrap_instrument()`, which resamples to every
+registered timeframe (3m/5m LTF, 75m HTF) and repairs whatever candle
+was truncated by the gap. This is a real implementation now, not a
+placeholder — verified with tests covering successful resync, empty
+broker responses, broker exceptions, and the recent-lookback filter.
+
 Loads config, confirms the token is live-accepted, connects the
 WebSocket feed, and runs the full pipeline: tick → candle → rolling base
 → sweep → displacement → FVG → retest → filters → entry → fill →
@@ -230,7 +272,7 @@ Every meaningful stage logs a distinct `[TAG]` to `logs/bot.log`:
 `grep '\[TAG\]' logs/bot.log` to trace any one stage end to end, or paste
 the whole file back for review.
 
-## 7. Known gaps to watch for
+## 9. Known gaps to watch for
 
 - **Delta may not be available from Fyers' option chain API.** Not a problem anymore —
   `execution/greeks_engine.py` computes Delta locally (Black-Scholes from the
@@ -254,10 +296,16 @@ the whole file back for review.
   watch for `[Unrecognized feed shape]`.
 - **Expiry response shape unverified live** for Fyers: watch for
   `[No expiryData in option chain response]`.
-- **REST resync on reconnect** logs a placeholder — historical-candle
-  backfill on WS reconnect isn't implemented yet.
+- **`main.py`'s Fyers-via-.env path is unchanged** for the single-client
+  no-web-UI case, but `TradingSession` itself is now fully broker-
+  agnostic (verified: the identical class constructs and runs correctly
+  against both Fyers and AngelOne adapters). Section 7's session manager
+  is the multi-broker/multi-client entrypoint.
+- **Per-client strategy config not yet built** — `config/settings.yaml`
+  is shared across every client in the session manager. Per-client
+  capital/risk/instrument overrides are a natural follow-up.
 
-## 8. Run tests
+## 10. Run tests
 
 ```bash
 pytest tests/ -v
@@ -270,13 +318,14 @@ against the original worked example, daily guard trip conditions, and a
 full position-lifecycle integration test (entry → fill → Target1 →
 breakeven → trailing stop → exit).
 
-## 9. Repo layout
+## 11. Repo layout
 
 ```
 config/          settings.yaml + config_loader.py + logging_setup.py    (done)
 auth/            auth.py — Fyers OAuth login/token lifecycle            (done)
 brokers/         base.py (BrokerAdapter interface, both auth styles),
-                 fyers_adapter.py, angelone_adapter.py, registry.py       (done — 2 brokers live)
+                 fyers_adapter.py, angelone_adapter.py, registry.py       (done — 2 brokers live, get_historical_candles on both)
+orchestration/   session_manager.py — N clients x N brokers, isolated    (done)
 webapp/          app.py, credential_vault.py, templates/ — login,
                  per-broker credential form, OAuth connect toggle        (done, trading loop not yet wired to it)
 data_feed/       fyers_rest_client.py, fyers_ws_client.py,
@@ -284,8 +333,8 @@ data_feed/       fyers_rest_client.py, fyers_ws_client.py,
 strategy/        rolling_base.py, state_store.py, sweep_detector.py,
                  displacement.py, retest_trigger.py, filters.py,
                  state_machine.py                                        (done, unit-tested, broker-agnostic)
-execution/       expiry_resolver.py, option_selector.py, risk_engine.py,
-                 order_manager.py, position_manager.py, greeks_engine.py (done — Delta computed locally, broker-independent)
+execution/       expiry_resolver.py, option_selector.py, generic_option_selector.py,
+                 risk_engine.py, order_manager.py, position_manager.py, greeks_engine.py (done)
 risk_controls/   daily_guard.py                                         (done, unit-tested)
 backtest/        replay_engine.py, candle_resampler.py, run_backtest.py    (done — replays real strategy code against real historical data)
 monitoring/      dashboard.py                                           (Phase 5.5 — not yet built)
@@ -295,7 +344,7 @@ tests/           74 unit + integration tests
 run_webapp.py    entrypoint for the web UI
 ```
 
-## 10. Not investment advice
+## 12. Not investment advice
 
 This is a technical build project. Sweep-based option buying carries fast,
 full-premium loss risk; strategy quality only shows up after real

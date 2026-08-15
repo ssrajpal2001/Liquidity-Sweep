@@ -1,24 +1,32 @@
 """
-main.py — orchestrator entrypoint (Fyers data feeder / broker).
+main.py — orchestrator entrypoint, broker-agnostic.
 
-Wires together: config -> auth (Fyers) -> REST client -> WS feed ->
-candle aggregator -> per-instrument state machine -> daily guard ->
-expiry resolver -> option selector -> risk engine -> order manager ->
+This runs against ANY BrokerAdapter (Fyers, AngelOne, or a future
+broker) — nothing in TradingSession imports a broker-specific class.
+Every broker-facing call goes through the BrokerAdapter interface
+(brokers/base.py): start_feed/subscribe/unsubscribe, get_option_chain,
+nearest_expiry, place_entry_buy/sell, get_order_status,
+get_historical_candles. Swapping which broker this runs against is a
+one-line change at the bottom of main() — the entire TradingSession
+class doesn't know or care which one it got.
+
+Wires together: config -> auth -> broker adapter -> WS feed -> candle
+aggregator -> per-instrument state machine -> daily guard -> expiry
+resolution -> option selection -> risk engine -> order manager ->
 position manager (entry/SL/TSL/target1/target2/exit).
 
 HARD SAFETY GATE: refuses to start unless settings.yaml's
-app.environment is "paper" AND .env's PAPER_MODE is true. Fyers has no
-confirmed broker-side sandbox (see execution/order_manager.py's
-docstring), so "paper" here means the bot runs against REAL live market
-data but every order is simulated locally rather than sent to Fyers —
-going live is a deliberate, separate step, not something that should
-happen because one of two flags got out of sync.
+app.environment is "paper" AND .env's PAPER_MODE is true — see
+_assert_paper_gate(). Going live is a deliberate, separate step.
+
+WS-RECONNECT RESYNC (previously a placeholder, now real): on reconnect,
+fetches recent 1-minute history via broker.get_historical_candles() and
+feeds it through CandleAggregator.bootstrap_instrument(), which
+resamples to every registered timeframe and repairs whatever candle was
+truncated by the gap — see data_feed/candle_aggregator.py's docstring.
 
 Every meaningful stage logs a distinct [TAG] — see execution/
-position_manager.py's docstring for the full list — specifically so a
-session can be reviewed after the fact: tick -> candle -> sweep ->
-displacement -> FVG -> retest -> filters -> entry -> fill -> SL/TSL ->
-target -> exit.
+position_manager.py's docstring for the full list.
 """
 from __future__ import annotations
 
@@ -26,17 +34,15 @@ import logging
 import signal
 import sys
 import time
-from datetime import timedelta, timezone
+from datetime import date, timedelta, timezone
 
 from auth.auth import FyersAuth
+from brokers.base import BrokerAdapter
+from brokers.fyers_adapter import FyersBrokerAdapter
 from config.config_loader import ConfigError, Settings, load_settings
 from config.logging_setup import setup_logging
 from data_feed.candle_aggregator import Candle, CandleAggregator
-from data_feed.fyers_rest_client import FyersRestClient
-from data_feed.fyers_ws_client import FyersWSClient
-from execution.expiry_resolver import ExpiryResolver
-from execution.option_selector import OptionSelector
-from execution.order_manager import OrderManager
+from execution.generic_option_selector import GenericOptionSelector
 from execution.position_manager import Position, PositionManager
 from execution.risk_engine import compute_risk_plan
 from risk_controls.daily_guard import DailyGuard
@@ -48,7 +54,8 @@ logger = logging.getLogger("main")
 IST = timezone(timedelta(hours=5, minutes=30))
 
 WS_STALE_WARNING_SECONDS = 60
-WS_FORCE_RECONNECT_SECONDS = 120  # if the SDK's own limited retry has plausibly given up
+WS_FORCE_RECONNECT_SECONDS = 120
+RESYNC_LOOKBACK_MINUTES = 180  # how far back to fetch on reconnect — comfortably covers one 75m HTF bucket
 
 
 def _assert_paper_gate(settings: Settings) -> None:
@@ -65,24 +72,28 @@ def _assert_paper_gate(settings: Settings) -> None:
 
 
 class TradingSession:
-    def __init__(self, settings: Settings, rest_client: FyersRestClient):
+    """Broker-agnostic — depends only on brokers.base.BrokerAdapter,
+    never on a concrete Fyers/AngelOne class."""
+
+    def __init__(self, settings: Settings, broker: BrokerAdapter, session_id: str | None = None):
         self.settings = settings
-        self.rest_client = rest_client
-        self.store = StateStore()
+        self.broker = broker
+        self.session_id = session_id or broker.broker_name
+        # Per-session state path — critical for multi-client: without
+        # this, two clients both trading NIFTY would share one rolling-
+        # base/void-state file and silently corrupt each other's state.
+        from pathlib import Path
+        state_path = Path(f"state/{self.session_id}_strategy_state.json")
+        self.store = StateStore(state_path)
 
         self.daily_guard = DailyGuard(
             total_capital_inr=settings.capital["total_capital_inr"],
             max_daily_loss_pct=settings.capital["max_daily_loss_pct"],
             max_trades_per_day=settings.capital["max_trades_per_day"],
         )
-
-        self.expiry_resolver = ExpiryResolver(rest_client.model)
-        self.order_manager = OrderManager(
-            rest_client.model, paper_mode=settings.env.paper_mode
-        )
         self.position_manager = PositionManager(
-            order_manager=self.order_manager,
-            get_order_status_fn=self.order_manager.get_order_status,
+            order_manager=broker,  # BrokerAdapter already exposes place_entry_buy/place_exit_sell/get_order_status
+            get_order_status_fn=broker.get_order_status,
             trail_distance_points=settings.risk.get("trail_distance_points", 5.0),
             target1_booking_pct=settings.execution["target1_booking_pct"],
             on_closed=self._on_position_closed,
@@ -94,8 +105,8 @@ class TradingSession:
 
         self.candle_agg = CandleAggregator(on_close=self._on_candle_close)
         self.state_machines: dict[str, InstrumentStateMachine] = {}
-        self.option_selectors: dict[str, OptionSelector] = {}
-        self.open_positions: dict[str, Position] = {}  # spot_key -> Position
+        self.option_selectors: dict[str, GenericOptionSelector] = {}
+        self.open_positions: dict[str, Position] = {}
         self.positions_by_option_symbol: dict[str, Position] = {}
         self.instrument_by_key = {i["spot_key"]: i for i in self.instruments}
 
@@ -112,8 +123,8 @@ class TradingSession:
                 sweep_buffer_points=settings.risk["sweep_buffer_points"].get(inst["name"], 5),
                 atr_multiplier=settings.risk["atr_displacement_multiplier"],
             )
-            self.option_selectors[key] = OptionSelector(
-                rest_client.model,
+            self.option_selectors[key] = GenericOptionSelector(
+                broker,
                 underlying_symbol=key,
                 strike_interval=inst["strike_interval"],
                 target_delta_min=settings.raw["option_selection"]["target_delta_min"],
@@ -121,7 +132,6 @@ class TradingSession:
                 cache_refresh_seconds=settings.raw["option_selection"]["delta_cache_refresh_seconds"],
             )
 
-        self.ws_client: FyersWSClient | None = None
         self._latest_spot: dict[str, float] = {}
 
     # -- candle pipeline -----------------------------------------------------
@@ -161,7 +171,7 @@ class TradingSession:
         inst_config = self.instrument_by_key[instrument_key]
         option_type = "PE" if decision.direction == "bearish" else "CE"
 
-        expiry = self.expiry_resolver.nearest_expiry(instrument_key)
+        expiry = self.broker.nearest_expiry(instrument_key)
         if expiry is None:
             logger.error("[SIGNAL_SKIPPED] %s no resolvable expiry.", instrument_key)
             return
@@ -205,12 +215,11 @@ class TradingSession:
         if position is not None:
             self.open_positions[instrument_key] = position
             self.positions_by_option_symbol[selected.symbol] = position
-            if self.ws_client is not None:
-                subscribed = self.ws_client.subscribe([selected.symbol])
-                logger.info(
-                    "[OPTION_LEG_SUBSCRIBED] %s subscribed=%s — SL/TSL/Target now tracking this contract's live price.",
-                    selected.symbol, subscribed,
-                )
+            subscribed = self.broker.subscribe([selected.symbol])
+            logger.info(
+                "[OPTION_LEG_SUBSCRIBED] %s subscribed=%s — SL/TSL/Target now tracking this contract's live price.",
+                selected.symbol, subscribed,
+            )
 
     def _on_position_closed(self, position: Position) -> None:
         self.daily_guard.record_trade_closed(position.realized_pnl_inr)
@@ -218,21 +227,32 @@ class TradingSession:
             if pos is position:
                 del self.open_positions[spot_key]
         self.positions_by_option_symbol.pop(position.instrument_key, None)
-        if self.ws_client is not None:
-            self.ws_client.unsubscribe([position.instrument_key])
+        self.broker.unsubscribe([position.instrument_key])
 
-    # -- reconnect resync ------------------------------------------------------
+    # -- WS-reconnect resync (real implementation, not a placeholder) -----------
     def _rest_resync_on_reconnect(self) -> None:
-        logger.info(
-            "[WS_RECONNECT_RESYNC] Historical candle backfill not yet implemented — "
-            "candles closed during the disconnect gap may be incomplete. "
-            "Flagging here so any signal right after a reconnect gets extra scrutiny."
-        )
+        today = date.today()
+        for inst in self.instruments:
+            key = inst["spot_key"]
+            try:
+                raw = self.broker.get_historical_candles(key, today, today)
+            except Exception:  # noqa: BLE001
+                logger.exception("[WS_RECONNECT_RESYNC] Failed to fetch resync data for %s", key)
+                continue
+            if not raw:
+                logger.warning("[WS_RECONNECT_RESYNC] No candle data returned for %s — gap not repaired.", key)
+                continue
+            cutoff = time.time() - RESYNC_LOOKBACK_MINUTES * 60
+            recent = [c for c in raw if c[0] >= cutoff]
+            self.candle_agg.bootstrap_instrument(key, recent)
+            logger.info(
+                "[WS_RECONNECT_RESYNC] %s: repaired from %d recent 1-min candles.",
+                key, len(recent),
+            )
 
     # -- lifecycle --------------------------------------------------------------
     def start(self) -> None:
         symbols = [i["spot_key"] for i in self.instruments]
-        combined_token = self.rest_client.auth.get_valid_token()
 
         def on_tick(symbol: str, ltp: float):
             position = self.positions_by_option_symbol.get(symbol)
@@ -242,20 +262,32 @@ class TradingSession:
             self.candle_agg.ingest_tick(symbol, ltp, epoch_ms=None)
             self._latest_spot[symbol] = ltp
 
-        self.ws_client = FyersWSClient(
-            combined_token=combined_token,
-            symbols=symbols,
-            on_tick=on_tick,
-            on_reconnect=self._rest_resync_on_reconnect,
-            litemode=True,
-        )
-        self.ws_client.start()
-        logger.info("[SESSION_STARTED] instruments=%s", symbols)
+        self.broker.start_feed(symbols, on_tick=on_tick, on_reconnect=self._rest_resync_on_reconnect)
+        logger.info("[SESSION_STARTED] session_id=%s instruments=%s broker=%s",
+                    self.session_id, symbols, self.broker.broker_name)
 
     def stop(self) -> None:
-        if self.ws_client is not None:
-            self.ws_client.stop()
-        logger.info("[SESSION_STOPPED]")
+        self.broker.stop_feed()
+        logger.info("[SESSION_STOPPED] session_id=%s", self.session_id)
+
+
+def _get_broker_adapter(settings: Settings) -> BrokerAdapter:
+    """Fyers-via-.env only, for now — the direct main.py-style path.
+    Running against AngelOne (or any web-UI-connected broker) needs a
+    per-client BrokerAdapter built from vault credentials instead — that
+    plumbing lives in backtest/run_backtest.py's _get_adapter() and is
+    the natural template for a future multi-client session manager, not
+    duplicated here."""
+    auth = FyersAuth(settings.env)
+    if not auth.is_authenticated():
+        raise RuntimeError("Not authenticated. Run: python -m auth.auth login")
+    adapter = FyersBrokerAdapter(settings.env, paper_mode=settings.env.paper_mode)
+    check = adapter.test_connection()
+    if not check.ok:
+        raise RuntimeError(f"Broker connectivity check failed: {check.detail}")
+    logger.info("[CONNECTIVITY_OK] broker=%s user=%s paper_mode=%s",
+                adapter.broker_name, check.user_name, settings.env.paper_mode)
+    return adapter
 
 
 def main() -> int:
@@ -274,21 +306,13 @@ def main() -> int:
         logger.error(str(exc))
         return 1
 
-    auth = FyersAuth(settings.env)
-    if not auth.is_authenticated():
-        logger.error("Not authenticated. Run: python -m auth.auth login")
+    try:
+        broker = _get_broker_adapter(settings)
+    except RuntimeError as exc:
+        logger.error(str(exc))
         return 1
 
-    rest_client = FyersRestClient(settings.env, auth=auth)
-    check = rest_client.test_connection()
-    if not check.ok:
-        logger.error("Fyers connectivity check failed: %s", check.detail)
-        return 1
-    logger.info(
-        "[CONNECTIVITY_OK] user=%s paper_mode=%s", check.user_name, settings.env.paper_mode
-    )
-
-    session = TradingSession(settings, rest_client)
+    session = TradingSession(settings, broker)
     session.start()
 
     stop_requested = {"flag": False}
@@ -300,23 +324,23 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    logger.info("Bot running (paper mode). Press Ctrl+C to stop.")
+    logger.info("Bot running (paper mode, broker=%s). Press Ctrl+C to stop.", broker.broker_name)
     last_forced_reconnect = 0.0
     try:
         while not stop_requested["flag"]:
             time.sleep(1)
-            stale = session.ws_client.seconds_since_last_message() if session.ws_client else None
+            stale = broker.seconds_since_last_message()
             if stale is not None and stale > WS_STALE_WARNING_SECONDS:
                 logger.warning("[FEED_STALE] no WS messages received in %.0fs", stale)
             if (
-                session.ws_client is not None
-                and not session.ws_client.is_open
+                not broker.is_feed_open
                 and stale is not None
                 and stale > WS_FORCE_RECONNECT_SECONDS
                 and time.time() - last_forced_reconnect > WS_FORCE_RECONNECT_SECONDS
+                and hasattr(broker, "force_outer_reconnect")
             ):
                 logger.warning("[FEED_STALE] forcing outer reconnect after %.0fs closed.", stale)
-                session.ws_client.force_outer_reconnect()
+                broker.force_outer_reconnect()
                 last_forced_reconnect = time.time()
     finally:
         session.stop()

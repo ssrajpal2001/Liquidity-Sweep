@@ -477,3 +477,44 @@ class AngelOneBrokerAdapter(BrokerAdapter):
                     "average_price": float(order.get("averageprice", 0) or 0),
                 }
         return {"status": "unknown"}
+
+    def get_historical_candles(self, symbol: str, from_date, to_date) -> list[tuple]:
+        """symbol here is the instrument name AngelOne uses for spot
+        index tokens ('NIFTY', 'BANKNIFTY') — see KNOWN_INDEX_SPOT_TOKENS.
+        Response shape confirmed against real forum-posted samples:
+        response['data'] = [[datetime_str, o, h, l, c, v], ...]."""
+        smart = self._get_smart()
+        if smart is None:
+            return []
+        token = self._instrument_master.spot_index_token(symbol.upper(), "NSE")
+        if token is None:
+            logger.error(
+                "No known AngelOne spot index token for %s — see "
+                "KNOWN_INDEX_SPOT_TOKENS (community-reported, not independently verified).",
+                symbol,
+            )
+            return []
+
+        params = {
+            "exchange": "NSE", "symboltoken": token, "interval": "ONE_MINUTE",
+            "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
+            "todate": to_date.strftime("%Y-%m-%d 15:30"),
+        }
+        try:
+            response = smart.getCandleData(params)
+        except Exception:  # noqa: BLE001
+            logger.exception("AngelOne getCandleData failed for %s", symbol)
+            return []
+        if not response or not response.get("status"):
+            logger.error("AngelOne getCandleData failed for %s: %s", symbol, response)
+            return []
+
+        candles = []
+        for row in response.get("data", []):
+            try:
+                dt_str, o, h, l, c, v = row
+                ts = datetime.fromisoformat(dt_str)
+                candles.append((ts.timestamp(), o, h, l, c, v))
+            except (ValueError, TypeError):
+                logger.warning("Skipping malformed AngelOne candle row: %s", row)
+        return candles
