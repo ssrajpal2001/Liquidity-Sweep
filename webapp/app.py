@@ -84,6 +84,15 @@ def create_app() -> Flask:
     vault = CredentialVault(encryption_key, db_path=credential_vault_module.DB_PATH)
     users = UserStore()
 
+    # The trading engine runs INSIDE this process now — one process-wide
+    # SessionManager, started here so Start/Stop routes and status polling
+    # all talk to the same in-memory running sessions. This is what makes
+    # "merge web app + trading engine" concrete rather than aspirational:
+    # a session started via a button click is the exact same TradingSession
+    # object a status route reads from, no IPC/shared-file layer needed.
+    from orchestration.session_manager import SessionManager
+    session_manager = SessionManager()
+
     def login_required(view):
         @functools.wraps(view)
         def wrapped(*args, **kwargs):
@@ -215,6 +224,11 @@ def create_app() -> Flask:
     @app.route("/brokers/<broker_name>/disconnect")
     @login_required
     def broker_disconnect(broker_name: str):
+        # Stop trading first if it's running — disconnecting the broker
+        # out from under a live session would leave it holding a dead
+        # connection rather than failing cleanly.
+        if session_manager.get_status(session["user_id"], broker_name).get("running"):
+            session_manager.stop_one(session["user_id"], broker_name)
         vault.set_connected(session["user_id"], broker_name, False)
         token_path = TOKEN_STORE_DIR / f"{session['user_id']}__{broker_name}_token_store.json"
         if token_path.exists():
@@ -234,5 +248,50 @@ def create_app() -> Flask:
             "connected": check.ok, "detail": check.detail,
             "user_name": check.user_name, "user_id": check.user_id,
         })
+
+    # -- trading engine control (merged into this process) ---------------------
+    @app.route("/brokers/<broker_name>/start_trading", methods=["POST"])
+    @login_required
+    def start_trading(broker_name: str):
+        status = vault.list_broker_status(session["user_id"], [broker_name])
+        if not status[broker_name]["connected"]:
+            return redirect(url_for("broker_credentials", broker_name=broker_name))
+        ok, message = session_manager.start_one(session["user_id"], broker_name)
+        logger.info("[UI_START_TRADING] user=%s broker=%s ok=%s: %s",
+                    session["user_id"], broker_name, ok, message)
+        return redirect(url_for("dashboard"))
+
+    @app.route("/brokers/<broker_name>/stop_trading", methods=["POST"])
+    @login_required
+    def stop_trading(broker_name: str):
+        ok, message = session_manager.stop_one(session["user_id"], broker_name)
+        logger.info("[UI_STOP_TRADING] user=%s broker=%s ok=%s: %s",
+                    session["user_id"], broker_name, ok, message)
+        return redirect(url_for("dashboard"))
+
+    @app.route("/brokers/<broker_name>/trading_status")
+    @login_required
+    def trading_status(broker_name: str):
+        return jsonify(session_manager.get_status(session["user_id"], broker_name))
+
+    # -- in-browser log viewer -------------------------------------------------
+    @app.route("/logs")
+    @login_required
+    def logs_page():
+        return render_template("logs.html")
+
+    @app.route("/logs/tail")
+    @login_required
+    def logs_tail():
+        from config.logging_setup import DEFAULT_LOG_DIR
+
+        log_path = DEFAULT_LOG_DIR / "bot.log"
+        if not log_path.exists():
+            return jsonify({"lines": ["(no log file yet — logs appear once the trading engine has started)"]})
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            return jsonify({"lines": [f"(error reading log file: {exc})"]})
+        return jsonify({"lines": lines[-200:]})  # last 200 lines — enough context without shipping the whole file every poll
 
     return app

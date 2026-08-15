@@ -96,49 +96,51 @@ by Fyers:
   between `settings.yaml` and `.env` stops the bot rather than guessing
   which one you meant.
 
-## 4. Web UI — register, log in, pick a broker, connect
+## 4. Web UI — register, log in, pick a broker, connect, trade, monitor
 
 ```bash
 python run_webapp.py
 ```
 
-That's it — **no `.env` setup required.** The two infra secrets it needs
-(Flask session key, vault encryption key) auto-generate into
+No `.env` setup required. Open the printed URL:
+
+1. **Register** a new account, **log in**.
+2. Dashboard lists brokers. Pick one, **Add credentials**, **Connect**
+   (OAuth redirect for Fyers, direct TOTP login for AngelOne).
+3. Once connected, hit **Start Trading** — this launches the full live
+   tick → signal → order pipeline **inside this same process**, right
+   from the button. No SSH, no separate script.
+4. The dashboard polls live status every 8s: feed health, open
+   positions (entry, SL, Target 1, quantity, running P&L), daily
+   trade count, and daily guard state.
+5. **Stop Trading** to halt that broker's session (does not close open
+   positions — that's a deliberate separate action, same as the daily
+   guard's kill switch).
+6. **View logs** (top nav) — the same `logs/bot.log` the CLI tools write
+   to, tailed live in the browser, auto-refreshing every 5s.
+
+**Architecture note:** the trading engine (`orchestration.
+session_manager.SessionManager`) now runs as a singleton **inside the
+Flask process** — Start/Stop buttons and the status endpoints all read
+from the exact same in-memory session objects, no shared file or IPC
+layer between "the UI" and "the engine." This is what makes the status
+panel genuinely live rather than polling a stale cache.
+
+Disconnecting a broker that's currently trading stops that session
+first automatically, rather than leaving a dangling connection.
+
+**No `.env` setup required** — the two infra secrets needed (Flask
+session key, vault encryption key) auto-generate into
 `secrets/webapp_secret.key` / `secrets/webapp_encryption.key` on first
-run and are reused forever after. Everything else — accounts, broker
-credentials, connection state — lives in `secrets/credentials.db`,
-created automatically too.
+run and are reused forever after (back these up separately — losing the
+encryption key makes every stored credential permanently unreadable).
+Everything else — accounts, credentials, connection state — lives in
+`secrets/credentials.db`, created automatically.
 
-This prints a URL (`http://<ec2-public-ip>:5000/register`) — open it in
-a browser:
-
-1. **Register** a new account (username + password, 8+ characters).
-2. **Log in.**
-3. Dashboard lists brokers from the registry (`fyers`, `angelone`, more
-   as they're added). Pick one, **Add credentials** — the form fields
-   are broker-specific, defined once per adapter.
-4. Hit **Connect**.
-
-**Two connect flows, depending on the broker:**
-- **OAuth redirect** (Fyers, and future Zerodha/Upstox): Connect sends
-  your browser to the broker's own login page, which redirects back here
-  once you log in there.
-- **Direct credentials** (AngelOne): Connect logs in immediately, right
-  here, using the client code / PIN / TOTP secret you entered — no
-  browser redirect at all. This also means AngelOne can re-authenticate
-  itself headlessly if a session goes stale, with no daily manual step.
-
-Either way you land back on the dashboard with a live-verified
-connection, polled every 10s.
-
-**Multiple clients:** each registered account only ever sees its own
-broker credentials and connection state — verified by a cross-user
-isolation test (`tests/test_webapp_flow.py`).
-
-**Credentials never touch `.env`** — they're stored encrypted in
-`secrets/credentials.db` (Fernet, key from `secrets/webapp_encryption.key`
-— back that file up separately; losing it makes every stored credential
-permanently unreadable).
+**Multiple clients:** each registered account only sees its own broker
+credentials and its own running trading sessions — verified by tests,
+including that stopping/starting one client's session never touches
+another's.
 
 ### HTTPS note — read this before trying to connect a broker
 
@@ -326,8 +328,9 @@ auth/            auth.py — Fyers OAuth login/token lifecycle            (done)
 brokers/         base.py (BrokerAdapter interface, both auth styles),
                  fyers_adapter.py, angelone_adapter.py, registry.py       (done — 2 brokers live, get_historical_candles on both)
 orchestration/   session_manager.py — N clients x N brokers, isolated    (done)
-webapp/          app.py, credential_vault.py, templates/ — login,
-                 per-broker credential form, OAuth connect toggle        (done, trading loop not yet wired to it)
+webapp/          app.py, credential_vault.py, user_store.py,
+                 broker_session_builder.py, templates/ — register, login,
+                 credentials, connect, Start/Stop trading, live log viewer (done — trading engine runs in-process)
 data_feed/       fyers_rest_client.py, fyers_ws_client.py,
                  candle_aggregator.py                                    (done, tick shape unverified live)
 strategy/        rolling_base.py, state_store.py, sweep_detector.py,

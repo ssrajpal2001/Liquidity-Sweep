@@ -270,6 +270,38 @@ class TradingSession:
         self.broker.stop_feed()
         logger.info("[SESSION_STOPPED] session_id=%s", self.session_id)
 
+    def get_status(self) -> dict:
+        """Everything the web UI's live dashboard needs — positions,
+        daily P&L, guard state, feed health. Reads directly from
+        in-memory state (this session runs in the same process as the
+        Flask app that calls this), no separate IPC needed."""
+        can_trade, guard_reason = self.daily_guard.can_trade()
+        guard_state = self.daily_guard.state
+        return {
+            "session_id": self.session_id,
+            "broker": self.broker.broker_name,
+            "feed_open": self.broker.is_feed_open,
+            "seconds_since_last_message": self.broker.seconds_since_last_message(),
+            "open_positions": [
+                {
+                    "instrument": spot_key,
+                    "option_symbol": pos.instrument_key,
+                    "direction": pos.direction,
+                    "status": pos.status.value,
+                    "entry_price": pos.plan.entry_price,
+                    "current_sl": pos.current_sl,
+                    "target1_price": pos.plan.target1_price,
+                    "remaining_quantity": pos.remaining_quantity,
+                    "realized_pnl_inr": round(pos.realized_pnl_inr, 2),
+                }
+                for spot_key, pos in self.open_positions.items()
+            ],
+            "daily_trades": guard_state.trades_taken,
+            "daily_realized_pnl_inr": round(guard_state.realized_pnl_inr, 2),
+            "can_trade": can_trade,
+            "guard_reason": guard_reason,
+        }
+
 
 def _get_broker_adapter(settings: Settings) -> BrokerAdapter:
     """Fyers-via-.env only, for now — the direct main.py-style path.

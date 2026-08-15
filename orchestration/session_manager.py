@@ -87,6 +87,39 @@ class SessionManager:
         self.running: dict[tuple[str, str], RunningSession] = {}
         self._stopping = False
 
+    def start_one(self, username: str, broker_name: str) -> tuple[bool, str]:
+        """Public, UI-triggered version of _start_one — returns (ok, message)
+        instead of just logging, so a Flask route can show the result."""
+        key = (username, broker_name)
+        if key in self.running:
+            return True, "Already running."
+        before = set(self.running.keys())
+        self._start_one(username, broker_name)
+        if key in self.running:
+            return True, f"Trading started for {broker_name}."
+        return False, f"Failed to start {broker_name} — check logs/bot.log for [SESSION_START_FAILED]."
+
+    def stop_one(self, username: str, broker_name: str) -> tuple[bool, str]:
+        key = (username, broker_name)
+        running = self.running.pop(key, None)
+        if running is None:
+            return False, "Not currently running."
+        try:
+            running.trading_session.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("[SESSION_STOP_FAILED] %s", key)
+            return False, "Error while stopping — check logs/bot.log."
+        logger.info("[SESSION_MANAGER_STOPPED] user=%s broker=%s", username, broker_name)
+        return True, f"Trading stopped for {broker_name}."
+
+    def get_status(self, username: str, broker_name: str) -> dict:
+        running = self.running.get((username, broker_name))
+        if running is None:
+            return {"running": False}
+        status = running.trading_session.get_status()
+        status["running"] = True
+        return status
+
     def _start_one(self, username: str, broker_name: str) -> None:
         key = (username, broker_name)
         if key in self.running:

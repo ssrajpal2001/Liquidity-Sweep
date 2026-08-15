@@ -127,6 +127,116 @@ def test_session_manager_stop_all_stops_every_running_session(vault_setup):
     assert manager.running == {}
 
 
+def test_start_one_returns_ok_and_message_on_success(vault_setup):
+    manager = SessionManager()
+    fake_settings = MagicMock()
+    fake_settings.raw = {"app": {"environment": "paper"}}
+    fake_settings.env.paper_mode = True
+
+    with patch("orchestration.session_manager.load_settings", return_value=fake_settings), \
+         patch("orchestration.session_manager.build_connected_adapter") as mock_build, \
+         patch("orchestration.session_manager.TradingSession") as MockTradingSession:
+        mock_build.return_value = MagicMock()
+        MockTradingSession.return_value = MagicMock()
+
+        ok, message = manager.start_one("alice", "fyers")
+
+    assert ok is True
+    assert ("alice", "fyers") in manager.running
+
+
+def test_start_one_returns_false_on_failure(vault_setup):
+    from webapp.broker_session_builder import BrokerSessionError
+
+    manager = SessionManager()
+    fake_settings = MagicMock()
+    fake_settings.raw = {"app": {"environment": "paper"}}
+    fake_settings.env.paper_mode = True
+
+    with patch("orchestration.session_manager.load_settings", return_value=fake_settings), \
+         patch("orchestration.session_manager.build_connected_adapter",
+               side_effect=BrokerSessionError("token expired")):
+        ok, message = manager.start_one("alice", "fyers")
+
+    assert ok is False
+    assert ("alice", "fyers") not in manager.running
+
+
+def test_start_one_is_idempotent_when_already_running(vault_setup):
+    manager = SessionManager()
+    fake_settings = MagicMock()
+    fake_settings.raw = {"app": {"environment": "paper"}}
+    fake_settings.env.paper_mode = True
+
+    with patch("orchestration.session_manager.load_settings", return_value=fake_settings), \
+         patch("orchestration.session_manager.build_connected_adapter") as mock_build, \
+         patch("orchestration.session_manager.TradingSession") as MockTradingSession:
+        mock_build.return_value = MagicMock()
+        MockTradingSession.return_value = MagicMock()
+
+        manager.start_one("alice", "fyers")
+        ok, message = manager.start_one("alice", "fyers")  # second call, already running
+
+    assert ok is True
+    assert "Already running" in message
+    assert MockTradingSession.call_count == 1  # not started twice
+
+
+def test_stop_one_stops_and_removes_the_session(vault_setup):
+    manager = SessionManager()
+    fake_settings = MagicMock()
+    fake_settings.raw = {"app": {"environment": "paper"}}
+    fake_settings.env.paper_mode = True
+
+    with patch("orchestration.session_manager.load_settings", return_value=fake_settings), \
+         patch("orchestration.session_manager.build_connected_adapter") as mock_build, \
+         patch("orchestration.session_manager.TradingSession") as MockTradingSession:
+        mock_build.return_value = MagicMock()
+        mock_session = MagicMock()
+        MockTradingSession.return_value = mock_session
+
+        manager.start_one("alice", "fyers")
+        ok, message = manager.stop_one("alice", "fyers")
+
+    assert ok is True
+    mock_session.stop.assert_called_once()
+    assert ("alice", "fyers") not in manager.running
+
+
+def test_stop_one_on_non_running_session_returns_false(vault_setup):
+    manager = SessionManager()
+    ok, message = manager.stop_one("alice", "fyers")
+    assert ok is False
+    assert "Not currently running" in message
+
+
+def test_get_status_reports_not_running_when_absent(vault_setup):
+    manager = SessionManager()
+    status = manager.get_status("alice", "fyers")
+    assert status == {"running": False}
+
+
+def test_get_status_delegates_to_trading_session_when_running(vault_setup):
+    manager = SessionManager()
+    fake_settings = MagicMock()
+    fake_settings.raw = {"app": {"environment": "paper"}}
+    fake_settings.env.paper_mode = True
+
+    with patch("orchestration.session_manager.load_settings", return_value=fake_settings), \
+         patch("orchestration.session_manager.build_connected_adapter") as mock_build, \
+         patch("orchestration.session_manager.TradingSession") as MockTradingSession:
+        mock_build.return_value = MagicMock()
+        mock_session = MagicMock()
+        mock_session.get_status.return_value = {"open_positions": [], "daily_trades": 0}
+        MockTradingSession.return_value = mock_session
+
+        manager.start_one("alice", "fyers")
+        status = manager.get_status("alice", "fyers")
+
+    assert status["running"] is True
+    assert status["daily_trades"] == 0
+
+
 def test_session_manager_one_broken_session_does_not_block_others(vault_setup):
     """A build_connected_adapter failure for one (user, broker) pair must
     not prevent the other pairs from starting."""

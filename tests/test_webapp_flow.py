@@ -201,3 +201,127 @@ def test_connect_without_credentials_redirects_to_credentials_form(client):
     r = client.get("/brokers/fyers/connect", follow_redirects=False)
     assert r.status_code == 302
     assert "/brokers/fyers/credentials" in r.headers["Location"]
+
+
+# -- trading engine merged into this process ----------------------------------
+
+def test_trading_status_reports_not_running_before_start(client):
+    _register(client)
+    r = client.get("/brokers/fyers/trading_status")
+    assert r.status_code == 200
+    assert r.get_json() == {"running": False}
+
+
+def test_start_trading_without_connection_redirects_to_credentials(client):
+    _register(client)
+    r = client.post("/brokers/fyers/start_trading", follow_redirects=False)
+    assert r.status_code == 302
+    assert "/brokers/fyers/credentials" in r.headers["Location"]
+
+
+def test_start_trading_launches_a_real_session_visible_in_status(client):
+    from unittest.mock import MagicMock, patch
+
+    _register(client)
+    client.post("/brokers/fyers/credentials", data={
+        "client_id": "XC1234-100", "secret_key": "mysecret", "redirect_uri": "https://example.com/cb",
+    })
+    # Manually mark connected (normally set by the OAuth callback route).
+    import webapp.credential_vault as cv
+    vault = cv.CredentialVault(app_module.get_or_create_encryption_key(), db_path=cv.DB_PATH)
+    vault.set_connected("alice", "fyers", True)
+
+    fake_settings = MagicMock()
+    fake_settings.raw = {"app": {"environment": "paper"}}
+    fake_settings.env.paper_mode = True
+
+    with patch("orchestration.session_manager.load_settings", return_value=fake_settings), \
+         patch("orchestration.session_manager.build_connected_adapter") as mock_build, \
+         patch("orchestration.session_manager.TradingSession") as MockTradingSession:
+        mock_build.return_value = MagicMock()
+        mock_session = MagicMock()
+        mock_session.get_status.return_value = {
+            "open_positions": [], "daily_trades": 0, "daily_realized_pnl_inr": 0.0,
+            "can_trade": True, "guard_reason": "OK", "feed_open": True,
+        }
+        MockTradingSession.return_value = mock_session
+
+        r = client.post("/brokers/fyers/start_trading", follow_redirects=False)
+        assert r.status_code == 302
+
+        status_r = client.get("/brokers/fyers/trading_status")
+        status = status_r.get_json()
+        assert status["running"] is True
+        assert status["daily_trades"] == 0
+
+        stop_r = client.post("/brokers/fyers/stop_trading", follow_redirects=False)
+        assert stop_r.status_code == 302
+        mock_session.stop.assert_called_once()
+
+        status_after_stop = client.get("/brokers/fyers/trading_status").get_json()
+        assert status_after_stop == {"running": False}
+
+
+def test_disconnect_while_trading_stops_the_session_first(client):
+    from unittest.mock import MagicMock, patch
+
+    _register(client)
+    client.post("/brokers/fyers/credentials", data={
+        "client_id": "XC1234-100", "secret_key": "mysecret", "redirect_uri": "https://example.com/cb",
+    })
+    import webapp.credential_vault as cv
+    vault = cv.CredentialVault(app_module.get_or_create_encryption_key(), db_path=cv.DB_PATH)
+    vault.set_connected("alice", "fyers", True)
+
+    fake_settings = MagicMock()
+    fake_settings.raw = {"app": {"environment": "paper"}}
+    fake_settings.env.paper_mode = True
+
+    with patch("orchestration.session_manager.load_settings", return_value=fake_settings), \
+         patch("orchestration.session_manager.build_connected_adapter") as mock_build, \
+         patch("orchestration.session_manager.TradingSession") as MockTradingSession:
+        mock_build.return_value = MagicMock()
+        mock_session = MagicMock()
+        MockTradingSession.return_value = mock_session
+
+        client.post("/brokers/fyers/start_trading")
+        client.get("/brokers/fyers/disconnect", follow_redirects=False)
+
+        mock_session.stop.assert_called_once()  # disconnect stopped the running session, not just left it dangling
+
+
+# -- log viewer ------------------------------------------------------------
+
+def test_logs_page_requires_login(client):
+    r = client.get("/logs", follow_redirects=False)
+    assert r.status_code == 302
+    assert "/login" in r.headers["Location"]
+
+
+def test_logs_page_loads_when_logged_in(client):
+    _register(client)
+    r = client.get("/logs")
+    assert r.status_code == 200
+
+
+def test_logs_tail_returns_json_with_placeholder_when_no_log_file(client, tmp_path):
+    from unittest.mock import patch
+    _register(client)
+    with patch("config.logging_setup.DEFAULT_LOG_DIR", tmp_path / "nonexistent_logs"):
+        r = client.get("/logs/tail")
+    assert r.status_code == 200
+    data = r.get_json()
+    assert "lines" in data
+
+
+def test_logs_tail_returns_actual_log_content(client, tmp_path):
+    from unittest.mock import patch
+    _register(client)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "bot.log").write_text("line1\nline2\nline3\n", encoding="utf-8")
+
+    with patch("config.logging_setup.DEFAULT_LOG_DIR", log_dir):
+        r = client.get("/logs/tail")
+    data = r.get_json()
+    assert data["lines"] == ["line1", "line2", "line3"]

@@ -41,4 +41,4 @@ if __name__ == "__main__":
         "needs to be https://, and this dev server only speaks http:// — "
         "see README 'HTTPS note' before trying to Connect one of those.\n"
     )
-    app.run(host=host, port=port, debug=False)
+    app.run(host=host, port=port, debug=False, threaded=True)
