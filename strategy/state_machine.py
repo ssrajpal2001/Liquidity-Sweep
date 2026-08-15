@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from data_feed.candle_aggregator import Candle
 from strategy import displacement as displacement_mod
@@ -69,12 +69,20 @@ class InstrumentStateMachine:
         session_config: dict,
         sweep_buffer_points: float,
         atr_multiplier: float = 1.5,
+        on_event: Optional[Callable[[str, dict], None]] = None,
     ):
         self.instrument_key = instrument_key
         self.store = store
         self.session_config = session_config
         self.sweep_buffer_points = sweep_buffer_points
         self.atr_multiplier = atr_multiplier
+        # Optional diagnostic hook — default no-op, zero effect on live
+        # trading behavior. Fires at every pipeline stage (rolling base
+        # update, sweep detected/rejected, displacement, FVG, retest
+        # armed/triggered/stale, signal filtered/passed) so a backtest
+        # reporting layer can build a full audit trail without needing to
+        # duplicate or monkeypatch this class's internals.
+        self._on_event = on_event or (lambda event, data: None)
 
         self.rolling_base = RollingBaseEngine(instrument_key, store)
         self.retest = RetestWatcher()
@@ -117,6 +125,10 @@ class InstrumentStateMachine:
     def on_htf_candle_close(self, candle: Candle) -> None:
         new_base_established = self.rolling_base.on_htf_candle_close(candle)
         if new_base_established:
+            base = self.rolling_base.current_base
+            self._on_event("rolling_base_updated", {
+                "candle_open_time": candle.open_time, "base_high": base.high, "base_low": base.low,
+            })
             state = self.store.get(self.instrument_key)
             if state.void_blocked:
                 state.void_blocked = False
@@ -136,8 +148,14 @@ class InstrumentStateMachine:
 
         # 1. Retest watcher takes priority if already armed from a prior candle.
         if self.retest.is_armed:
-            if self.retest.check(candle):
+            was_armed_before = self.retest.is_armed
+            triggered = self.retest.check(candle)
+            if triggered:
+                self._on_event("retest_triggered", {"candle_open_time": candle.open_time})
                 return self._finalize_signal(candle)
+            if was_armed_before and not self.retest.is_armed:
+                # check() disarmed it internally (staleness) without triggering.
+                self._on_event("retest_stale", {"candle_open_time": candle.open_time})
             return None
 
         if self._is_blocked():
@@ -152,6 +170,10 @@ class InstrumentStateMachine:
         if sweep is None:
             return None
         logger.info("%s: sweep detected — %s", self.instrument_key, sweep)
+        self._on_event("sweep_detected", {
+            "candle_open_time": candle.open_time, "direction": sweep.direction.value,
+            "level": sweep.level, "pierce_points": sweep.pierce_points,
+        })
         self._pending_sweep = sweep
 
         # 3. Displacement / MSS confirmation on this same candle (the sweep
@@ -164,9 +186,16 @@ class InstrumentStateMachine:
             candle, lookback, recent_swing_high, recent_swing_low, self.atr_multiplier
         )
         if disp is None:
+            self._on_event("sweep_rejected", {
+                "candle_open_time": candle.open_time, "reason": "no_displacement",
+            })
             self._pending_sweep = None
             return None
         logger.info("%s: displacement confirmed — %s", self.instrument_key, disp)
+        self._on_event("displacement_confirmed", {
+            "candle_open_time": candle.open_time, "direction": disp.direction.value,
+            "body_to_atr_ratio": disp.body_to_atr_ratio,
+        })
 
         # 4. FVG check needs the candle after the displacement candle, which
         #    we don't have yet on this call — arm the retest watcher only
@@ -177,6 +206,14 @@ class InstrumentStateMachine:
             )
             if fvg is not None:
                 self.retest.arm(fvg)
+                self._on_event("retest_armed", {
+                    "candle_open_time": candle.open_time, "gap_low": fvg.gap_low, "gap_high": fvg.gap_high,
+                })
+            else:
+                self._on_event("sweep_rejected", {
+                    "candle_open_time": candle.open_time, "reason": "no_fvg",
+                })
+                self._pending_sweep = None
         return None
 
     def _finalize_signal(self, entry_candle: Candle) -> Optional[SignalDecision]:
@@ -200,6 +237,9 @@ class InstrumentStateMachine:
         window_ok, window_reason = is_within_trading_window(entry_candle.open_time, self.session_config)
         if not window_ok:
             logger.info("%s: signal discarded — %s", self.instrument_key, window_reason)
+            self._on_event("signal_filtered", {
+                "candle_open_time": entry_candle.open_time, "reason": window_reason,
+            })
             return None
 
         base = self.rolling_base.current_base
@@ -209,6 +249,9 @@ class InstrumentStateMachine:
         bias_ok, bias_reason = is_bias_aligned(sweep.direction.value, bias)
         if not bias_ok:
             logger.info("%s: signal discarded — %s", self.instrument_key, bias_reason)
+            self._on_event("signal_filtered", {
+                "candle_open_time": entry_candle.open_time, "reason": bias_reason,
+            })
             return None
 
         logger.info("%s: signal PASSED all filters — %s", self.instrument_key, bias_reason)
@@ -217,6 +260,11 @@ class InstrumentStateMachine:
             spot_sl = sweep.candle.high + self.sweep_buffer_points
         else:
             spot_sl = sweep.candle.low - self.sweep_buffer_points
+
+        self._on_event("signal_passed", {
+            "candle_open_time": entry_candle.open_time, "direction": sweep.direction.value,
+            "spot_sl": spot_sl,
+        })
 
         return SignalDecision(
             instrument_key=self.instrument_key,
