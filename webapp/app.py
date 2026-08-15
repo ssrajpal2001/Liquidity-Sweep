@@ -202,6 +202,12 @@ def create_app() -> Flask:
         return redirect(login_url)
 
     @app.route("/brokers/<broker_name>/callback")
+    @app.route("/callback/<broker_name>")  # alias: some broker apps have a fixed/locked
+    # redirect URI that can't be changed after registration (e.g. shared
+    # with another application already using that exact URL) — this lets
+    # the callback work at either path without needing two copies of the
+    # handler logic, or forcing the person to break their other app's
+    # registered URI just to match ours.
     @login_required
     def broker_callback(broker_name: str):
         adapter = _adapter_for(session["user_id"], broker_name, vault)

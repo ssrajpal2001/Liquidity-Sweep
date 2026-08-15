@@ -395,3 +395,28 @@ def test_connect_invalidates_stale_cached_status(client):
 
         r2 = client.get("/brokers/angelone/status").get_json()
         assert r2["connected"] is True  # must NOT be the stale cached "False" result
+
+
+def test_callback_alias_path_routes_to_same_handler_as_canonical_path(client):
+    """Some broker apps have a redirect URI locked/fixed after
+    registration (e.g. already shared with another application), so this
+    alias lets the OAuth callback work at /callback/<broker> as well as
+    the canonical /brokers/<broker>/callback, without duplicating the
+    handler logic."""
+    from unittest.mock import patch
+
+    _register(client)
+    client.post("/brokers/fyers/credentials", data={
+        "client_id": "XC1234-100", "secret_key": "mysecret", "redirect_uri": "https://example.com/callback/fyers",
+    })
+
+    with patch("brokers.fyers_adapter.FyersBrokerAdapter.exchange_code") as mock_exchange, \
+         patch("brokers.fyers_adapter.FyersBrokerAdapter.test_connection") as mock_test:
+        from brokers.base import ConnectionCheckResult
+        mock_test.return_value = ConnectionCheckResult(ok=True, detail="ok", user_name="Test", user_id="U1")
+
+        r = client.get("/callback/fyers?code=abc123&state=xyz", follow_redirects=False)
+
+    assert r.status_code == 302
+    assert r.headers["Location"] in ("/", "http://localhost/")
+    mock_exchange.assert_called_once()
