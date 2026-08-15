@@ -354,3 +354,44 @@ def test_status_route_throttles_repeated_polls_to_avoid_hammering_the_broker(cli
             client.get("/brokers/angelone/status")
 
     assert call_count["n"] == 1
+
+
+def test_connect_invalidates_stale_cached_status(client):
+    """Regression test for a real bug seen live: the status-throttle cache
+    (from the previous fix) wasn't cleared when the user clicked Connect,
+    so right after a successful reconnect the dashboard kept showing the
+    OLD cached 'invalid token' result for up to 45 seconds. Connect,
+    Disconnect, and the OAuth callback must all invalidate the cache for
+    that (user, broker) so status reflects reality immediately after an
+    action, not just on the next throttle window."""
+    import pyotp
+    from unittest.mock import patch
+    from brokers.base import ConnectionCheckResult
+
+    _register(client)
+    totp_secret = pyotp.random_base32()
+    client.post("/brokers/angelone/credentials", data={
+        "api_key": "test_key", "client_code": "A123456", "pin": "1234", "totp_secret": totp_secret,
+    })
+
+    results = [ConnectionCheckResult(ok=False, detail="invalid token", user_name="Test", user_id="A123456"),
+               ConnectionCheckResult(ok=True, detail="ok", user_name="Test", user_id="A123456")]
+
+    def fake_test_connection(self):
+        return results.pop(0) if results else ConnectionCheckResult(ok=True, detail="ok")
+
+    with patch("brokers.angelone_adapter.SmartConnect") as MockSmartConnect, \
+         patch("brokers.angelone_adapter.AngelOneBrokerAdapter.test_connection", fake_test_connection), \
+         patch("brokers.angelone_adapter.AngelOneBrokerAdapter.is_authenticated", return_value=True):
+        MockSmartConnect.return_value.generateSession.return_value = {
+            "status": True,
+            "data": {"jwtToken": "j", "refreshToken": "r", "feedToken": "f", "name": "Test", "clientcode": "A123456"},
+        }
+
+        r1 = client.get("/brokers/angelone/status").get_json()
+        assert r1["connected"] is False  # cached now
+
+        client.get("/brokers/angelone/connect")  # fresh login — must invalidate the cache
+
+        r2 = client.get("/brokers/angelone/status").get_json()
+        assert r2["connected"] is True  # must NOT be the stale cached "False" result

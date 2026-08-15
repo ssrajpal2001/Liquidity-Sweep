@@ -186,6 +186,7 @@ def create_app() -> Flask:
             # already-stored credentials and show the result immediately.
             check = adapter.login()
             vault.set_connected(session["user_id"], broker_name, check.ok)
+            _status_cache.pop((session["user_id"], broker_name), None)  # force a fresh check, not the stale cached one
             logger.info(
                 "[BROKER_CONNECT_%s] user=%s broker=%s (direct login) user_name=%s",
                 "OK" if check.ok else "FAILED", session["user_id"], broker_name, check.user_name,
@@ -215,6 +216,7 @@ def create_app() -> Flask:
 
         check: ConnectionCheckResult = adapter.test_connection()
         vault.set_connected(session["user_id"], broker_name, check.ok)
+        _status_cache.pop((session["user_id"], broker_name), None)  # force a fresh check next poll
         logger.info(
             "[BROKER_CONNECT_%s] user=%s broker=%s user_name=%s",
             "OK" if check.ok else "FAILED", session["user_id"], broker_name, check.user_name,
@@ -230,6 +232,7 @@ def create_app() -> Flask:
         if session_manager.get_status(session["user_id"], broker_name).get("running"):
             session_manager.stop_one(session["user_id"], broker_name)
         vault.set_connected(session["user_id"], broker_name, False)
+        _status_cache.pop((session["user_id"], broker_name), None)  # force a fresh check next poll
         token_path = TOKEN_STORE_DIR / f"{session['user_id']}__{broker_name}_token_store.json"
         if token_path.exists():
             token_path.unlink()
