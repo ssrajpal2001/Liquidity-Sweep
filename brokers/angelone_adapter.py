@@ -200,25 +200,37 @@ class AngelOneBrokerAdapter(BrokerAdapter):
         health check should never have the side effect of performing a
         full fresh TOTP login against AngelOne's real servers. If the
         session genuinely needs refreshing, that's what the Connect
-        button is for — a deliberate action, not an automatic one."""
+        button is for — a deliberate action, not an automatic one.
+
+        Uses orderBook() rather than getProfile(refreshToken) as the live
+        check. Found via live debugging: getProfile(refreshToken) was
+        returning 'Invalid Token' (errorCode AG8001) even immediately
+        after a confirmed-working fresh login (proven by a separate
+        successful live tick-feed test using the same session) — the SDK
+        appears to route that refreshToken parameter through some kind of
+        token-refresh-style request, not a simple profile fetch, and it
+        wasn't behaving as assumed. orderBook() takes no parameters at
+        all and relies purely on the access token already set on the
+        connection — the same mechanism already proven to work for the
+        live feed — so it's a more defensible choice for "is this session
+        actually live" than a call whose parameter semantics weren't
+        fully verifiable without a live account."""
         smart = self._get_smart()
         if smart is None:
             return ConnectionCheckResult(ok=False, detail="No stored session — click Connect to log in.")
         try:
-            session = self.session_store.load()
-            profile = smart.getProfile(session.refresh_token if session else "")
+            response = smart.orderBook()
         except Exception as exc:  # noqa: BLE001
             logger.warning("AngelOne connectivity check failed: %s", exc)
             return ConnectionCheckResult(ok=False, detail=f"Connectivity check failed: {exc}")
 
-        if not profile or not profile.get("status"):
-            detail = profile.get("message", "Unknown error") if profile else "No response"
+        if not response or not response.get("status"):
+            detail = response.get("message", "Unknown error") if response else "No response"
             return ConnectionCheckResult(ok=False, detail=f"Session appears invalid: {detail}")
 
-        data = profile.get("data", {})
         return ConnectionCheckResult(
             ok=True, detail="Authenticated successfully.",
-            user_name=data.get("name"), user_id=data.get("clientcode"),
+            user_name=None, user_id=self.env.client_code,
         )
 
     # -- market data feed -------------------------------------------------------

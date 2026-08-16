@@ -148,18 +148,18 @@ def test_paper_order_never_calls_real_place_order(tmp_path):
     assert status["status"] == "complete"
 
 
-def test_test_connection_does_not_call_login_when_getprofile_fails(tmp_path):
+def test_test_connection_does_not_call_login_when_orderbook_fails(tmp_path):
     """Regression test for a real bug found live: test_connection() used
-    to silently fall back to a fresh TOTP login() on ANY getProfile
-    failure. Since this method gets called by the dashboard's status
-    polling every few seconds, that meant continuous re-authentication
-    against AngelOne's real servers. It must now just report the
-    failure, never call login() as a side effect."""
+    to silently fall back to a fresh TOTP login() on ANY connectivity
+    check failure. Since this method gets called by the dashboard's
+    status polling every few seconds, that meant continuous
+    re-authentication against AngelOne's real servers. It must now just
+    report the failure, never call login() as a side effect."""
     from unittest.mock import patch
 
     adapter = AngelOneBrokerAdapter(_make_env(tmp_path), paper_mode=True)
     mock_smart = MagicMock()
-    mock_smart.getProfile.side_effect = RuntimeError("network hiccup")
+    mock_smart.orderBook.side_effect = RuntimeError("network hiccup")
     adapter._smart = mock_smart
 
     with patch.object(adapter, "login") as mock_login:
@@ -170,12 +170,12 @@ def test_test_connection_does_not_call_login_when_getprofile_fails(tmp_path):
     assert "Connectivity check failed" in result.detail
 
 
-def test_test_connection_does_not_call_login_when_profile_status_false(tmp_path):
+def test_test_connection_does_not_call_login_when_orderbook_status_false(tmp_path):
     from unittest.mock import patch
 
     adapter = AngelOneBrokerAdapter(_make_env(tmp_path), paper_mode=True)
     mock_smart = MagicMock()
-    mock_smart.getProfile.return_value = {"status": False, "message": "session expired"}
+    mock_smart.orderBook.return_value = {"status": False, "message": "session expired"}
     adapter._smart = mock_smart
     adapter.session_store.save = MagicMock()  # avoid touching disk for this test
 
@@ -186,17 +186,21 @@ def test_test_connection_does_not_call_login_when_profile_status_false(tmp_path)
     assert result.ok is False
 
 
-def test_test_connection_reports_ok_on_valid_profile(tmp_path):
+def test_test_connection_reports_ok_on_valid_orderbook_response(tmp_path):
+    """Regression test for the real bug found live: getProfile(refreshToken)
+    returned 'Invalid Token' even right after a confirmed-working fresh
+    login (proven separately by a successful live tick-feed test using
+    the same session). orderBook() — which takes no parameters and
+    relies purely on the already-set access token, the same mechanism
+    proven to work for the live feed — replaces it as the live check."""
     adapter = AngelOneBrokerAdapter(_make_env(tmp_path), paper_mode=True)
     mock_smart = MagicMock()
-    mock_smart.getProfile.return_value = {
-        "status": True, "data": {"name": "Test User", "clientcode": "A123456"},
-    }
+    mock_smart.orderBook.return_value = {"status": True, "data": []}
     adapter._smart = mock_smart
 
     result = adapter.test_connection()
     assert result.ok is True
-    assert result.user_name == "Test User"
+    mock_smart.getProfile.assert_not_called()  # the broken call must never be used
 
 
 def test_test_connection_reports_no_session_without_calling_login(tmp_path):
