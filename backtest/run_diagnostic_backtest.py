@@ -27,6 +27,7 @@ import argparse
 import logging
 import sys
 import tempfile
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -48,7 +49,23 @@ CHUNK_DAYS = 30  # per-request window for historical fetch - conservative, works
 LOT_SIZE = 65
 
 
+RATE_LIMIT_DELAY_SECONDS = 1.0   # pause between chunk requests, well under AngelOne's rate limit
+RATE_LIMIT_MAX_RETRIES = 3       # retries specifically for rate-limit errors, with backoff
+RATE_LIMIT_BACKOFF_SECONDS = 5.0  # wait before retrying a rate-limited chunk
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    return "exceeding access rate" in str(exc).lower() or "access denied" in str(exc).lower()
+
+
 def _fetch_chunked(adapter, symbol: str, from_date: date, to_date: date) -> list[tuple]:
+    """Real bug fixed here, found live: firing all ~25 chunk requests
+    back-to-back with zero delay hit AngelOne's rate limiter almost
+    immediately, silently dropping most of a 2-year run's data (12+ of
+    25 chunks failed with 'Access denied because of exceeding access
+    rate' within about 2 seconds of the run starting). Now pauses
+    between every chunk, and retries rate-limit-specific failures with
+    backoff before giving up on that window."""
     all_candles: list[tuple] = []
     chunk_start = from_date
     chunk_num = 0
@@ -58,13 +75,31 @@ def _fetch_chunked(adapter, symbol: str, from_date: date, to_date: date) -> list
         chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS - 1), to_date)
         chunk_num += 1
         logger.info("[FETCH_CHUNK %d/%d] %s to %s", chunk_num, total_chunks, chunk_start, chunk_end)
-        try:
-            candles = adapter.get_historical_candles(symbol, chunk_start, chunk_end)
-        except Exception:  # noqa: BLE001
-            logger.exception("Chunk fetch failed for %s to %s - skipping this window.", chunk_start, chunk_end)
-            candles = []
+
+        candles: list[tuple] = []
+        for attempt in range(1, RATE_LIMIT_MAX_RETRIES + 2):  # +1 initial try, then retries
+            try:
+                candles = adapter.get_historical_candles(symbol, chunk_start, chunk_end)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if _is_rate_limit_error(exc) and attempt <= RATE_LIMIT_MAX_RETRIES:
+                    wait = RATE_LIMIT_BACKOFF_SECONDS * attempt
+                    logger.warning(
+                        "[FETCH_CHUNK %d/%d] Rate limited (attempt %d/%d) - waiting %.0fs before retry.",
+                        chunk_num, total_chunks, attempt, RATE_LIMIT_MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                logger.exception(
+                    "Chunk fetch failed for %s to %s after %d attempt(s) - skipping this window.",
+                    chunk_start, chunk_end, attempt,
+                )
+                candles = []
+                break
+
         all_candles.extend(candles)
         chunk_start = chunk_end + timedelta(days=1)
+        time.sleep(RATE_LIMIT_DELAY_SECONDS)  # pace every request, not just ones that failed
 
     all_candles.sort(key=lambda c: c[0])
     return all_candles
