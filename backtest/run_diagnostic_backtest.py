@@ -126,11 +126,18 @@ def run(broker: str, username: str | None, from_date: date, to_date: date, outpu
         len(ltf_candles), ltf_minutes, len(htf_candles),
     )
 
+    from collections import Counter
+
     false_sweeps_filtered = {"count": 0}
+    rejection_breakdown: Counter = Counter()
+    stage_counts: Counter = Counter()  # how many times each pipeline stage fired, period
 
     def on_event(event_type: str, data: dict) -> None:
+        stage_counts[event_type] += 1
         if event_type in ("sweep_rejected", "signal_filtered"):
             false_sweeps_filtered["count"] += 1
+            reason = data.get("reason", "unknown")
+            rejection_breakdown[reason] += 1
 
     tmp_state = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     tmp_state.close()
@@ -157,6 +164,8 @@ def run(broker: str, username: str | None, from_date: date, to_date: date, outpu
                 signals.append(decision)
 
     logger.info("[DIAGNOSTIC_BACKTEST_SIGNALS] %d signals passed all filters.", len(signals))
+    logger.info("[DIAGNOSTIC_BACKTEST_STAGE_COUNTS] %s", dict(stage_counts))
+    logger.info("[DIAGNOSTIC_BACKTEST_REJECTION_BREAKDOWN] %s", dict(rejection_breakdown))
 
     trades = []
     for signal in signals:
@@ -167,6 +176,7 @@ def run(broker: str, username: str | None, from_date: date, to_date: date, outpu
     report = build_full_report(
         trades, false_sweeps_filtered=false_sweeps_filtered["count"],
         entry_ltf_minutes=ltf_minutes, instrument=instrument, from_date=from_date, to_date=to_date,
+        rejection_breakdown=dict(rejection_breakdown),
     )
 
     with open(output_path, "w", encoding="utf-8") as f:

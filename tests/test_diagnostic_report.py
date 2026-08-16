@@ -52,6 +52,28 @@ def test_performance_summary_handles_zero_trades_without_crashing():
     assert "Total Trades Triggered:** 0" in summary
 
 
+def test_performance_summary_includes_rejection_breakdown_when_provided():
+    """This IS the actual bottleneck diagnosis — sorted by count, highest
+    first, so the dominant rejection reason is immediately visible
+    without needing to grep a raw log file for event names that were
+    never actually written to it as text."""
+    summary = build_performance_summary(
+        [], false_sweeps_filtered=1547,
+        rejection_breakdown={"retest_stale": 900, "no_displacement": 400, "no_fvg": 247},
+    )
+    assert "retest_stale" in summary
+    assert "58.2%" in summary  # 900/1547
+    # sorted descending — retest_stale (highest count) must appear before no_fvg (lowest)
+    assert summary.index("retest_stale") < summary.index("no_fvg")
+
+
+def test_performance_summary_omits_breakdown_section_when_not_provided():
+    """Backward compatible — callers that don't pass a breakdown still
+    get a valid report, just without that extra section."""
+    summary = build_performance_summary([], false_sweeps_filtered=10)
+    assert "Rejection reason breakdown" not in summary
+
+
 def test_full_report_includes_all_required_sections():
     trade = _make_trade([_candle(25000, 25035, 24995, 25030, 18), _candle(25030, 25065, 25025, 25060, 21)])
     report = build_full_report([trade], false_sweeps_filtered=5, entry_ltf_minutes=3,

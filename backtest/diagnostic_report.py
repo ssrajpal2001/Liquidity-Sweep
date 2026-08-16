@@ -71,7 +71,9 @@ def build_trade_audit(trade: SimulatedTrade, index: int, base_high: Optional[flo
     return "\n".join(lines)
 
 
-def build_performance_summary(trades: list[SimulatedTrade], false_sweeps_filtered: int) -> str:
+def build_performance_summary(
+    trades: list[SimulatedTrade], false_sweeps_filtered: int, rejection_breakdown: dict | None = None
+) -> str:
     total = len(trades)
     wins = sum(1 for t in trades if t.outcome in (TradeOutcome.TARGET1_THEN_TARGET2, TradeOutcome.TARGET1_THEN_SL))
     win_rate = (wins / total * 100) if total else 0.0
@@ -88,7 +90,7 @@ def build_performance_summary(trades: list[SimulatedTrade], false_sweeps_filtere
 
     stale = sum(1 for t in trades if t.outcome == TradeOutcome.STALE)
 
-    return (
+    summary = (
         f"- **Total Trades Triggered:** {total}\n"
         f"- **Win Rate (T1/T2 completion):** {win_rate:.1f}%\n"
         f"- **Average R:R Achieved:** {avg_rr:+.2f}R\n"
@@ -98,6 +100,14 @@ def build_performance_summary(trades: list[SimulatedTrade], false_sweeps_filtere
         f"(rejected for no displacement, no FVG, or invalid time window/bias)\n"
     )
 
+    if rejection_breakdown:
+        summary += "\n**Rejection reason breakdown** (this is the actual bottleneck diagnosis — whichever reason has the highest count is where nearly everything is dying):\n\n"
+        for reason, count in sorted(rejection_breakdown.items(), key=lambda kv: -kv[1]):
+            pct = (count / false_sweeps_filtered * 100) if false_sweeps_filtered else 0
+            summary += f"- `{reason}`: {count} ({pct:.1f}%)\n"
+
+    return summary
+
 
 def build_full_report(
     trades: list[SimulatedTrade],
@@ -105,6 +115,7 @@ def build_full_report(
     entry_ltf_minutes: int,
     instrument: str,
     from_date, to_date,
+    rejection_breakdown: dict | None = None,
 ) -> str:
     parts = [
         f"# Diagnostic Backtest Report - {instrument} ({from_date} to {to_date})",
@@ -135,7 +146,7 @@ def build_full_report(
 
     parts.append("## 3. Performance Metrics")
     parts.append("")
-    parts.append(build_performance_summary(trades, false_sweeps_filtered))
+    parts.append(build_performance_summary(trades, false_sweeps_filtered, rejection_breakdown))
     parts.append(
         "\n---\n_P&L model note: this backtest simulates trading NIFTY SPOT directly "
         "(not an option contract), because 2 years of historical option premium data "
