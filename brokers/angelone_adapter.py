@@ -164,8 +164,25 @@ class AngelOneBrokerAdapter(BrokerAdapter):
             return ConnectionCheckResult(ok=False, detail=detail)
 
         data = result["data"]
+        # Real bug, found live: AngelOne's own generateSession() SDK code
+        # prepends "Bearer " to jwtToken internally (confirmed in the
+        # installed SDK's source). If that value is stored as-is and later
+        # passed back into SmartConnect(access_token=...), the SDK adds a
+        # SECOND "Bearer " prefix when building the actual request header
+        # -> "Bearer Bearer eyJ..." -> every REST call (getProfile,
+        # orderBook, everything) gets rejected as an invalid token. The
+        # WebSocket feed never showed this because it authenticates via
+        # feed_token through a separate mechanism entirely, which is why
+        # live ticks worked perfectly while every REST call silently
+        # failed with the exact same symptom. Stripping it here means the
+        # STORED token is always the raw JWT, so the SDK's own prefixing
+        # is correct and singular wherever this session gets loaded.
+        raw_jwt_token = data["jwtToken"]
+        if raw_jwt_token.startswith("Bearer "):
+            raw_jwt_token = raw_jwt_token[len("Bearer "):]
+
         session = AngelOneSession(
-            jwt_token=data["jwtToken"], refresh_token=data["refreshToken"],
+            jwt_token=raw_jwt_token, refresh_token=data["refreshToken"],
             feed_token=data["feedToken"], client_code=self.env.client_code,
             generated_at=datetime.now(IST).isoformat(),
         )
@@ -182,8 +199,14 @@ class AngelOneBrokerAdapter(BrokerAdapter):
         session = self.session_store.load()
         if session is None or session.is_stale():
             return None
+        # Defensive strip here too, for any session file already on disk
+        # from before this fix — no need to force everyone back through a
+        # fresh login just because an old file has the accidental prefix.
+        access_token = session.jwt_token
+        if access_token.startswith("Bearer "):
+            access_token = access_token[len("Bearer "):]
         smart = SmartConnect(
-            api_key=self.env.api_key, access_token=session.jwt_token,
+            api_key=self.env.api_key, access_token=access_token,
             refresh_token=session.refresh_token, feed_token=session.feed_token,
         )
         self._smart = smart

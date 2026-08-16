@@ -74,6 +74,65 @@ def test_login_success_persists_session(tmp_path):
     assert session.client_code == env.client_code
 
 
+def test_login_strips_bearer_prefix_that_the_sdk_bakes_into_jwttoken(tmp_path):
+    """Regression test for a real bug found live, reproduced from an
+    actual stored session file: the installed SmartApi SDK's own
+    generateSession() prepends "Bearer " to jwtToken internally (confirmed
+    in the SDK's source: user['data']['jwtToken'] = "Bearer " + jwtToken).
+    If that value is stored as-is and later fed back into
+    SmartConnect(access_token=...), the SDK adds a SECOND "Bearer " prefix
+    when building the request header -> "Bearer Bearer eyJ..." -> every
+    REST call gets rejected as an invalid token, while the WebSocket feed
+    (separate auth mechanism via feed_token) keeps working fine — exactly
+    the symptom that was live-debugged. The stored session must always
+    hold the RAW token, never the SDK's pre-prefixed one."""
+    env = _make_env(tmp_path)
+    adapter = AngelOneBrokerAdapter(env, paper_mode=True)
+
+    fake_response = {
+        "status": True,
+        "data": {
+            "jwtToken": "Bearer eyJhbGciOiJIUzUxMiJ9.fake.payload",  # SDK's real, confirmed shape
+            "refreshToken": "fake_refresh",
+            "feedToken": "fake_feed",
+            "name": "Test User",
+            "clientcode": env.client_code,
+        },
+    }
+    with patch("brokers.angelone_adapter.SmartConnect") as MockSmartConnect:
+        MockSmartConnect.return_value.generateSession.return_value = fake_response
+        result = adapter.login()
+
+    assert result.ok is True
+    session = adapter.session_store.load()
+    assert session.jwt_token == "eyJhbGciOiJIUzUxMiJ9.fake.payload"  # "Bearer " stripped
+    assert not session.jwt_token.startswith("Bearer")
+
+
+def test_get_smart_strips_bearer_prefix_from_pre_existing_session_files(tmp_path):
+    """The other half of the same fix: a session file already on disk
+    from BEFORE this fix (with the bad prefix baked in) must not force
+    everyone back through a fresh login — _get_smart() defends against it
+    too, using the exact bad value confirmed from a real stored file."""
+    from datetime import datetime, timezone, timedelta as _td
+
+    env = _make_env(tmp_path)
+    adapter = AngelOneBrokerAdapter(env, paper_mode=True)
+    IST_LOCAL = timezone(_td(hours=5, minutes=30))
+    bad_session = AngelOneSession(
+        jwt_token="Bearer eyJhbGciOiJIUzUxMiJ9.old.stored.token",  # pre-fix, bad prefix already saved
+        refresh_token="r", feed_token="f", client_code=env.client_code,
+        generated_at=datetime.now(IST_LOCAL).isoformat(),
+    )
+    adapter.session_store.save(bad_session)
+
+    with patch("brokers.angelone_adapter.SmartConnect") as MockSmartConnect:
+        adapter._get_smart()
+        call_kwargs = MockSmartConnect.call_args.kwargs
+        assert call_kwargs["access_token"] == "eyJhbGciOiJIUzUxMiJ9.old.stored.token"
+        assert not call_kwargs["access_token"].startswith("Bearer")
+
+
 def test_login_failure_does_not_persist_session(tmp_path):
     env = _make_env(tmp_path)
     adapter = AngelOneBrokerAdapter(env, paper_mode=True)
